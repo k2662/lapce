@@ -257,8 +257,11 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - name: Uninstall libgit2
-        run: brew uninstall libgit2
+      - name: Uninstall libgit2 and rust
+        run: brew uninstall rust libgit2
+
+      - name: install rust
+        run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
       - name: Install ARM target
         run: rustup update && rustup target add aarch64-apple-darwin
