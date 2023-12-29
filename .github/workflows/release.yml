@@ -257,6 +257,9 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
+      - name: Uninstall libgit2
+        run: brew uninstall libgit2
+
       - name: Install ARM target
         run: rustup update && rustup target add aarch64-apple-darwin
 
