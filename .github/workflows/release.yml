@@ -261,7 +261,7 @@ jobs:
         run: brew uninstall rust libgit2
 
       - name: install rust
-        run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+        run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -y
 
       - name: Install ARM target
         run: rustup update && rustup target add aarch64-apple-darwin
