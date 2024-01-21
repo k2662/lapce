@@ -13,7 +13,8 @@ use std::{
 use alacritty_terminal::{event::WindowSize, event_loop::Msg};
 use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::Sender;
-use git2::{build::CheckoutBuilder, DiffOptions, Repository};
+use git2::ErrorCode::NotFound;
+use git2::{build::CheckoutBuilder, DiffOptions, Oid, Repository};
 use grep_matcher::Matcher;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{sinks::UTF8, SearcherBuilder};
@@ -31,12 +32,14 @@ use lapce_rpc::{
     RequestId, RpcError,
 };
 use lapce_xi_rope::Rope;
-use lsp_types::{Position, Range, TextDocumentItem, Url};
+use lsp_types::{
+    MessageType, Position, Range, ShowMessageParams, TextDocumentItem, Url,
+};
 use parking_lot::Mutex;
 
 use crate::{
     buffer::{get_mod_time, load_file, Buffer},
-    plugin::{catalog::PluginCatalog, remove_volt, PluginCatalogRpcHandler},
+    plugin::{catalog::PluginCatalog, PluginCatalogRpcHandler},
     terminal::{Terminal, TerminalSender},
     watcher::{FileWatcher, Notify, WatchToken},
 };
@@ -268,14 +271,10 @@ impl ProxyHandler for Dispatcher {
                 let _ = self.catalog_rpc.reload_volt(volt);
             }
             RemoveVolt { volt } => {
-                let catalog_rpc = self.catalog_rpc.clone();
-                let _ = catalog_rpc.stop_volt(volt.info());
-                thread::spawn(move || {
-                    let _ = remove_volt(catalog_rpc, volt);
-                });
+                self.catalog_rpc.remove_volt(volt);
             }
             DisableVolt { volt } => {
-                let _ = self.catalog_rpc.stop_volt(volt);
+                self.catalog_rpc.stop_volt(volt);
             }
             EnableVolt { volt } => {
                 let _ = self.catalog_rpc.enable_volt(volt);
@@ -284,7 +283,15 @@ impl ProxyHandler for Dispatcher {
                 if let Some(workspace) = self.workspace.as_ref() {
                     match git_commit(workspace, &message, diffs) {
                         Ok(()) => (),
-                        Err(e) => eprintln!("{e:?}"),
+                        Err(e) => {
+                            self.core_rpc.show_message(
+                                "Git Commit failure".to_owned(),
+                                ShowMessageParams {
+                                    typ: MessageType::ERROR,
+                                    message: e.to_string(),
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -1205,18 +1212,35 @@ fn git_commit(
     index.write()?;
     let tree = index.write_tree()?;
     let tree = repo.find_tree(tree)?;
-    let signature = repo.signature()?;
-    let parent = repo.head()?.peel_to_commit()?;
 
-    repo.commit(
-        Some("HEAD"),
-        &signature,
-        &signature,
-        message,
-        &tree,
-        &[&parent],
-    )?;
-    Ok(())
+    match repo.signature() {
+        Ok(signature) => {
+            let parents = repo
+                .head()
+                .and_then(|head| Ok(vec![head.peel_to_commit()?]))
+                .unwrap_or(vec![]);
+            let parents_refs = parents.iter().collect::<Vec<_>>();
+
+            repo.commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                message,
+                &tree,
+                &parents_refs,
+            )?;
+            Ok(())
+        }
+        Err(e) => match e.code() {
+            NotFound => Err(anyhow!(
+                "No user.name and/or user.email configured for this git repository."
+            )),
+            _ => Err(anyhow!(
+                "Error while creating commit's signature: {}",
+                e.message()
+            )),
+        },
+    }
 }
 
 fn git_checkout(workspace_path: &Path, reference: &str) -> Result<()> {
@@ -1293,8 +1317,10 @@ fn git_delta_format(
 
 fn git_diff_new(workspace_path: &Path) -> Option<DiffInfo> {
     let repo = Repository::discover(workspace_path).ok()?;
-    let head = repo.head().ok()?;
-    let name = head.shorthand()?.to_string();
+    let name = match repo.head() {
+        Ok(head) => head.shorthand()?.to_string(),
+        _ => "(No branch)".to_owned(),
+    };
 
     let mut branches = Vec::new();
     for branch in repo.branches(None).ok()? {
@@ -1325,18 +1351,21 @@ fn git_diff_new(workspace_path: &Path) -> Option<DiffInfo> {
             deltas.push(delta);
         }
     }
+
+    let oid = match repo.revparse_single("HEAD^{tree}") {
+        Ok(obj) => obj.id(),
+        _ => Oid::zero(),
+    };
+
     let cached_diff = repo
-        .diff_tree_to_index(
-            repo.find_tree(repo.revparse_single("HEAD^{tree}").ok()?.id())
-                .ok()
-                .as_ref(),
-            None,
-            None,
-        )
-        .ok()?;
-    for delta in cached_diff.deltas() {
-        if let Some(delta) = git_delta_format(workspace_path, &delta) {
-            deltas.push(delta);
+        .diff_tree_to_index(repo.find_tree(oid).ok().as_ref(), None, None)
+        .ok();
+
+    if let Some(cached_diff) = cached_diff {
+        for delta in cached_diff.deltas() {
+            if let Some(delta) = git_delta_format(workspace_path, &delta) {
+                deltas.push(delta);
+            }
         }
     }
     let mut renames = Vec::new();

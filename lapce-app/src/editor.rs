@@ -103,6 +103,7 @@ impl EditorInfo {
                     None,
                     editor_id,
                     doc,
+                    None,
                     data.common,
                 );
                 editor_data.go_to_location(
@@ -155,6 +156,7 @@ impl EditorInfo {
                     None,
                     editor_id,
                     doc,
+                    None,
                     data.common,
                 )
             }
@@ -205,6 +207,7 @@ impl EditorData {
         diff_editor_id: Option<(EditorTabId, DiffEditorId)>,
         editor_id: EditorId,
         doc: Rc<Document>,
+        confirmed: Option<RwSignal<bool>>,
         common: Rc<CommonData>,
     ) -> Self {
         let cx = cx.create_child();
@@ -236,6 +239,7 @@ impl EditorData {
                 internal_comamnd.send(InternalCommand::ResetBlinkCursor);
             });
         }
+        let confirmed = confirmed.unwrap_or_else(|| cx.create_rw_signal(false));
         Self {
             scope: cx,
             editor_tab_id: cx.create_rw_signal(editor_tab_id),
@@ -243,7 +247,7 @@ impl EditorData {
             editor_id,
             view,
             cursor,
-            confirmed: cx.create_rw_signal(false),
+            confirmed,
             snippet: cx.create_rw_signal(None),
             window_origin: cx.create_rw_signal(Point::ZERO),
             viewport,
@@ -266,7 +270,7 @@ impl EditorData {
     ) -> Self {
         let cx = cx.create_child();
         let doc = Rc::new(Document::new_local(cx, common.clone()));
-        Self::new(cx, None, None, editor_id, doc, common)
+        Self::new(cx, None, None, editor_id, doc, None, common)
     }
 
     pub fn editor_info(&self, _data: &WindowTabData) -> EditorInfo {
@@ -290,6 +294,7 @@ impl EditorData {
         editor_tab_id: Option<EditorTabId>,
         diff_editor_id: Option<(EditorTabId, DiffEditorId)>,
         editor_id: EditorId,
+        confirmed: Option<RwSignal<bool>>,
     ) -> Self {
         let cx = cx.create_child();
         let cursor = cx.create_rw_signal(self.cursor.get_untracked());
@@ -301,6 +306,7 @@ impl EditorData {
             });
         }
         let viewport = cx.create_rw_signal(self.viewport.get_untracked());
+        let confirmed = confirmed.unwrap_or_else(|| cx.create_rw_signal(true));
 
         EditorData {
             scope: cx,
@@ -315,7 +321,7 @@ impl EditorData {
                 self.viewport.get_untracked().origin().to_vec2(),
             )),
             window_origin: cx.create_rw_signal(Point::ZERO),
-            confirmed: cx.create_rw_signal(true),
+            confirmed,
             snippet: cx.create_rw_signal(None),
             last_movement: cx.create_rw_signal(self.last_movement.get_untracked()),
             inline_find: cx.create_rw_signal(None),
@@ -1377,9 +1383,6 @@ impl EditorData {
             self.common.completion.update(|completion| {
                 completion.update_input(input.clone());
 
-                let cursor_offset = self.cursor.with_untracked(|c| c.offset());
-                completion.update_document_completion(&self.view, cursor_offset);
-
                 if !completion.input_items.contains_key("") {
                     let start_pos = doc.buffer.with_untracked(|buffer| {
                         buffer.offset_to_position(start_offset)
@@ -1406,6 +1409,12 @@ impl EditorData {
                     );
                 }
             });
+            let cursor_offset = self.cursor.with_untracked(|c| c.offset());
+            self.common
+                .completion
+                .get_untracked()
+                .update_document_completion(&self.view, cursor_offset);
+
             return;
         }
 
@@ -2656,12 +2665,12 @@ fn show_completion(
         | EditCommand::DeleteWordBackward
         | EditCommand::DeleteWordForward
         | EditCommand::DeleteForwardAndInsert => {
-            let start = match deltas.get(0).and_then(|delta| delta.0.els.get(0)) {
+            let start = match deltas.first().and_then(|delta| delta.0.els.first()) {
                 Some(lapce_xi_rope::DeltaElement::Copy(_, start)) => *start,
                 _ => 0,
             };
 
-            let end = match deltas.get(0).and_then(|delta| delta.0.els.get(1)) {
+            let end = match deltas.first().and_then(|delta| delta.0.els.get(1)) {
                 Some(lapce_xi_rope::DeltaElement::Copy(end, _)) => *end,
                 _ => 0,
             };
@@ -2956,7 +2965,7 @@ fn compute_screen_lines(
 
                             // Skip over the lines
                             if let Some(skip) = bothinfo.skip.as_ref() {
-                                if skip.start == line - start {
+                                if Some(skip.start) == line.checked_sub(start) {
                                     y_idx += 1;
                                     // Skip by `skip` count, which is skip - 1 because we will
                                     // go to the next vline on the next iter

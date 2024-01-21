@@ -950,8 +950,9 @@ impl WindowTabData {
             ConnectSshHost => {
                 self.palette.run(PaletteKind::SshHost);
             }
-            ConnectWsl => {
-                // TODO:
+            #[cfg(windows)]
+            ConnectWslHost => {
+                self.palette.run(PaletteKind::WslHost);
             }
             DisconnectRemote => {
                 self.common.window_common.window_command.send(
@@ -998,6 +999,7 @@ impl WindowTabData {
             ChangeFileLanguage => {
                 self.palette.run(PaletteKind::Language);
             }
+            DiffFiles => self.palette.run(PaletteKind::DiffFiles),
 
             // ==== Running / Debugging ====
             RunAndDebugRestart => {
@@ -1629,6 +1631,10 @@ impl WindowTabData {
                     self.common.config,
                 );
             }
+            InternalCommand::OpenDiffFiles {
+                left_path,
+                right_path,
+            } => self.main_split.open_diff_files(left_path, right_path),
         }
     }
 
@@ -1673,22 +1679,22 @@ impl WindowTabData {
             } => {
                 self.common.completion.update(|completion| {
                     completion.receive(*request_id, input, resp, *plugin_id);
-
-                    let editor_data = completion.latest_editor_id.and_then(|id| {
-                        self.main_split
-                            .editors
-                            .with_untracked(|tabs| tabs.get(&id).cloned())
-                    });
-
-                    if let Some(editor_data) = editor_data {
-                        let cursor_offset =
-                            editor_data.cursor.with_untracked(|c| c.offset());
-                        completion.update_document_completion(
-                            &editor_data.view,
-                            cursor_offset,
-                        );
-                    }
                 });
+
+                let completion = self.common.completion.get_untracked();
+                let editor_data = completion.latest_editor_id.and_then(|id| {
+                    self.main_split
+                        .editors
+                        .with_untracked(|tabs| tabs.get(&id).cloned())
+                });
+                if let Some(editor_data) = editor_data {
+                    let cursor_offset =
+                        editor_data.cursor.with_untracked(|c| c.offset());
+                    completion.update_document_completion(
+                        &editor_data.view,
+                        cursor_offset,
+                    );
+                }
             }
             CoreNotification::PublishDiagnostics { diagnostics } => {
                 let path = path_from_url(&diagnostics.uri);

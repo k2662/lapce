@@ -32,9 +32,8 @@ use floem::{
     view::View,
     views::{
         clip, container, container_box, drag_resize_window_area, drag_window_area,
-        empty, label, list, rich_text, scroll::scroll, stack, svg, tab, text,
-        virtual_list, Decorators, VirtualListDirection, VirtualListItemSize,
-        VirtualListVector,
+        dyn_stack, empty, label, rich_text, scroll::scroll, stack, svg, tab, text,
+        virtual_stack, Decorators, VirtualDirection, VirtualItemSize, VirtualVector,
     },
     window::{ResizeDirection, WindowConfig, WindowId},
     EventPropagation,
@@ -285,7 +284,9 @@ impl AppData {
                     .is_empty()
                     || !std::env::var("WSL_INTEROP").unwrap_or_default().is_empty()
                 {
-                    LapceWorkspaceType::RemoteWSL
+                    LapceWorkspaceType::RemoteWSL(crate::workspace::WslHost {
+                        host: String::new(),
+                    })
                 } else {
                     LapceWorkspaceType::Local
                 };
@@ -689,11 +690,17 @@ fn editor_tab_header(
         };
 
         let confirmed = match local_child {
-            EditorTabChild::Editor(editor_id) => {
-                let editor_data = editors
-                    .with_untracked(|editors| editors.get(&editor_id).cloned());
-                editor_data.map(|editor_data| editor_data.confirmed)
-            }
+            EditorTabChild::Editor(editor_id) => editors.with_untracked(|editors| {
+                editors
+                    .get(&editor_id)
+                    .map(|editor_data| editor_data.confirmed)
+            }),
+            EditorTabChild::DiffEditor(diff_editor_id) => diff_editors
+                .with_untracked(|diff_editors| {
+                    diff_editors
+                        .get(&diff_editor_id)
+                        .map(|diff_editor_data| diff_editor_data.confirmed)
+                }),
             _ => None,
         };
 
@@ -892,7 +899,7 @@ fn editor_tab_header(
         }),
         container({
             scroll({
-                list(items, key, view_fn)
+                dyn_stack(items, key, view_fn)
                     .on_resize(move |rect| {
                         let size = rect.size();
                         if content_size.get_untracked() != size {
@@ -1449,7 +1456,7 @@ fn split_resize_border(
             split.with_untracked(|split| split.direction)
         }
     };
-    list(
+    dyn_stack(
         move || {
             let data = split.get();
             data.children.into_iter().enumerate().skip(1)
@@ -1580,7 +1587,7 @@ fn split_border(
     config: ReadSignal<Arc<LapceConfig>>,
 ) -> impl View {
     let direction = move || split.with(|split| split.direction);
-    list(
+    dyn_stack(
         move || split.get().children.into_iter().skip(1),
         |(_, content)| content.id(),
         move |(_, content)| {
@@ -1745,7 +1752,7 @@ fn split_list(
     };
     container_box(
         stack((
-            list(items, key, view_fn).style(move |s| {
+            dyn_stack(items, key, view_fn).style(move |s| {
                 s.flex_direction(match direction() {
                     SplitDirection::Vertical => FlexDirection::Row,
                     SplitDirection::Horizontal => FlexDirection::Column,
@@ -1897,15 +1904,15 @@ fn palette_item(
         | PaletteItemContent::Reference { path, .. } => {
             let file_name = path
                 .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
             // let (file_name, _) = create_signal(cx.scope, file_name);
             let folder = path
                 .parent()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
+                .unwrap_or("".as_ref())
+                .to_string_lossy()
+                .into_owned();
             // let (folder, _) = create_signal(cx.scope, folder);
             let folder_len = folder.len();
 
@@ -2214,7 +2221,7 @@ fn palette_item(
                             .flex_grow(1.0)
                             .align_items(Some(AlignItems::Center))
                     }),
-                    stack((list(
+                    stack((dyn_stack(
                         move || keys.clone(),
                         |k| k.clone(),
                         move |key| {
@@ -2253,6 +2260,19 @@ fn palette_item(
                 .style(|s| s.align_items(Some(AlignItems::Center)).max_width_full()),
             )
         }
+        #[cfg(windows)]
+        PaletteItemContent::WslHost { .. } => {
+            let text = item.filter_text;
+            let indices = item.indices;
+            container_box(
+                focus_text(
+                    move || text.clone(),
+                    move || indices.clone(),
+                    move || config.get().color(LapceColor::EDITOR_FOCUS),
+                )
+                .style(|s| s.align_items(Some(AlignItems::Center)).max_width_full()),
+            )
+        }
     }
     .style(move |s| {
         s.width_full()
@@ -2271,32 +2291,34 @@ fn palette_input(window_tab_data: Rc<WindowTabData>) -> impl View {
     let config = window_tab_data.common.config;
     let focus = window_tab_data.common.focus;
     let is_focused = move || focus.get() == Focus::Palette;
-    container(
-        container(text_input(editor, is_focused).style(|s| s.width_full())).style(
-            move |s| {
-                let config = config.get();
-                s.width_full()
-                    .height(25.0)
-                    .items_center()
-                    .border_bottom(1.0)
-                    .border_color(config.color(LapceColor::LAPCE_BORDER))
-                    .background(config.color(LapceColor::EDITOR_BACKGROUND))
-            },
-        ),
-    )
+
+    let input = text_input(editor, is_focused)
+        .placeholder(move || window_tab_data.palette.placeholder_text().to_owned())
+        .style(|s| s.width_full());
+
+    container(container(input).style(move |s| {
+        let config = config.get();
+        s.width_full()
+            .height(25.0)
+            .items_center()
+            .border_bottom(1.0)
+            .border_color(config.color(LapceColor::LAPCE_BORDER))
+            .background(config.color(LapceColor::EDITOR_BACKGROUND))
+    }))
     .style(|s| s.padding_bottom(5.0))
 }
 
 struct PaletteItems(im::Vector<PaletteItem>);
 
-impl VirtualListVector<(usize, PaletteItem)> for PaletteItems {
-    type ItemIterator = Box<dyn Iterator<Item = (usize, PaletteItem)>>;
-
+impl VirtualVector<(usize, PaletteItem)> for PaletteItems {
     fn total_len(&self) -> usize {
         self.0.len()
     }
 
-    fn slice(&mut self, range: Range<usize>) -> Self::ItemIterator {
+    fn slice(
+        &mut self,
+        range: Range<usize>,
+    ) -> impl Iterator<Item = (usize, PaletteItem)> {
         let start = range.start;
         Box::new(
             self.0
@@ -2328,9 +2350,9 @@ fn palette_content(
     stack((
         scroll({
             let workspace = workspace.clone();
-            virtual_list(
-                VirtualListDirection::Vertical,
-                VirtualListItemSize::Fixed(Box::new(move || palette_item_height)),
+            virtual_stack(
+                VirtualDirection::Vertical,
+                VirtualItemSize::Fixed(Box::new(move || palette_item_height)),
                 move || PaletteItems(items.get()),
                 move |(i, _item)| {
                     (run_id.get_untracked(), *i, input.get_untracked().input)
@@ -2350,7 +2372,7 @@ fn palette_content(
 
                         cmd_kind
                             .and_then(|kind| keymaps.get(kind.str()))
-                            .and_then(|maps| maps.get(0))
+                            .and_then(|maps| maps.first())
                     };
                     container(palette_item(
                         workspace,
@@ -2558,7 +2580,7 @@ fn window_message_view(
         container(
             container(
                 scroll(
-                    list(
+                    dyn_stack(
                         move || messages.get().into_iter().enumerate(),
                         move |_| {
                             id.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -2585,22 +2607,18 @@ fn window_message_view(
 
 struct VectorItems<V>(im::Vector<V>);
 
-impl<V: Clone + 'static> VirtualListVector<(usize, V)> for VectorItems<V> {
-    type ItemIterator = Box<dyn Iterator<Item = (usize, V)>>;
-
+impl<V: Clone + 'static> VirtualVector<(usize, V)> for VectorItems<V> {
     fn total_len(&self) -> usize {
         self.0.len()
     }
 
-    fn slice(&mut self, range: Range<usize>) -> Self::ItemIterator {
+    fn slice(&mut self, range: Range<usize>) -> impl Iterator<Item = (usize, V)> {
         let start = range.start;
-        Box::new(
-            self.0
-                .slice(range)
-                .into_iter()
-                .enumerate()
-                .map(move |(i, item)| (i + start, item)),
-        )
+        self.0
+            .slice(range)
+            .into_iter()
+            .enumerate()
+            .map(move |(i, item)| (i + start, item))
     }
 }
 
@@ -2631,7 +2649,7 @@ fn hover(window_tab_data: Rc<WindowTabData>) -> impl View {
     let layout_rect = window_tab_data.common.hover.layout_rect;
 
     scroll(
-        list(
+        dyn_stack(
             move || hover_data.content.get(),
             move |_| id.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             move |content| match content {
@@ -2686,9 +2704,9 @@ fn completion(window_tab_data: Rc<WindowTabData>) -> impl View {
     let request_id =
         move || completion_data.with_untracked(|c| (c.request_id, c.input_id));
     scroll(
-        virtual_list(
-            VirtualListDirection::Vertical,
-            VirtualListItemSize::Fixed(Box::new(move || {
+        virtual_stack(
+            VirtualDirection::Vertical,
+            VirtualItemSize::Fixed(Box::new(move || {
                 config.get().editor.line_height() as f64
             })),
             move || completion_data.with(|c| VectorItems(c.filtered_items.clone())),
@@ -2790,7 +2808,7 @@ fn code_action(window_tab_data: Rc<WindowTabData>) -> impl View {
         move || code_action.with_untracked(|code_action| code_action.request_id);
     scroll(
         container(
-            list(
+            dyn_stack(
                 move || {
                     code_action.with(|code_action| {
                         code_action.filtered_items.clone().into_iter().enumerate()
@@ -2959,9 +2977,9 @@ fn workspace_title(workspace: &LapceWorkspace) -> Option<String> {
     let dir = p.file_name().unwrap_or(p.as_os_str()).to_string_lossy();
     Some(match &workspace.kind {
         LapceWorkspaceType::Local => format!("{dir}"),
-        LapceWorkspaceType::RemoteSSH(ssh) => format!("{dir} [{ssh}]"),
+        LapceWorkspaceType::RemoteSSH(remote) => format!("{dir} [{remote}]"),
         #[cfg(windows)]
-        LapceWorkspaceType::RemoteWSL => format!("{dir} [wsl]"),
+        LapceWorkspaceType::RemoteWSL(remote) => format!("{dir} [{remote}]"),
     })
 }
 
@@ -3163,7 +3181,7 @@ fn workspace_tab_header(window_data: WindowData) -> impl View {
                 .width(75.0)
                 .apply_if(!is_macos, |s| s.hide())
         }),
-        list(
+        dyn_stack(
             move || {
                 let tabs = tabs.get();
                 for (i, (index, _)) in tabs.iter().enumerate() {

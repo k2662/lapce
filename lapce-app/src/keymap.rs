@@ -9,8 +9,8 @@ use floem::{
     style::CursorStyle,
     view::View,
     views::{
-        container, label, list, scroll, stack, text, virtual_list, Decorators,
-        VirtualListDirection, VirtualListItemSize,
+        container, dyn_stack, label, scroll, stack, text, virtual_stack, Decorators,
+        VirtualDirection, VirtualItemSize,
     },
 };
 use lapce_core::mode::Modes;
@@ -57,17 +57,33 @@ pub fn keymap_view(common: Rc<CommonData>) -> impl View {
             .iter()
             .filter_map(|keymap| {
                 let cmd = keypress.commands.get(&keymap.command).cloned()?;
-                let match_pattern =
-                    cmd.kind.str().replace('_', " ").contains(&pattern)
-                        || cmd
-                            .kind
-                            .desc()
-                            .map(|desc| desc.to_lowercase().contains(&pattern))
-                            .unwrap_or(false);
-                if !match_pattern {
-                    return None;
+
+                let cmd_name_contains_pattern =
+                    cmd.kind.str().replace('_', " ").contains(&pattern);
+                let cmd_desc_contains_pattern = cmd
+                    .kind
+                    .desc()
+                    .map(|desc| desc.to_lowercase().contains(&pattern))
+                    .unwrap_or(false);
+                let shortcut_contains_pattern = keymap
+                    .key
+                    .iter()
+                    .any(|k| k.label().trim().to_lowercase().contains(&pattern));
+                let when_contains_pattern = keymap
+                    .when
+                    .as_ref()
+                    .map(|when| when.to_lowercase().contains(&pattern))
+                    .unwrap_or(false);
+
+                if cmd_name_contains_pattern
+                    || cmd_desc_contains_pattern
+                    || shortcut_contains_pattern
+                    || when_contains_pattern
+                {
+                    Some((cmd, Some(keymap.clone())))
+                } else {
+                    None
                 }
-                Some((cmd, Some(keymap.clone())))
             })
             .collect::<im::Vector<(LapceCommand, Option<KeyMap>)>>();
         items.extend(keypress.commands_without_keymap.iter().filter_map(|cmd| {
@@ -119,7 +135,7 @@ pub fn keymap_view(common: Rc<CommonData>) -> impl View {
                 }),
                 {
                     let keymap = keymap.clone();
-                    list(
+                    dyn_stack(
                         move || {
                             keymap
                                 .as_ref()
@@ -180,7 +196,7 @@ pub fn keymap_view(common: Rc<CommonData>) -> impl View {
                                 .collect::<Vec<String>>()
                         })
                         .unwrap_or_default();
-                    list(
+                    dyn_stack(
                         move || modes.clone(),
                         |m| m.clone(),
                         move |mode| {
@@ -327,9 +343,9 @@ pub fn keymap_view(common: Rc<CommonData>) -> impl View {
         }),
         container(
             scroll(
-                virtual_list(
-                    VirtualListDirection::Vertical,
-                    VirtualListItemSize::Fixed(Box::new(ui_line_height)),
+                virtual_stack(
+                    VirtualDirection::Vertical,
+                    VirtualItemSize::Fixed(Box::new(ui_line_height)),
                     items,
                     |(i, (cmd, keymap)): &(
                         usize,
@@ -374,7 +390,7 @@ fn keyboard_picker_view(
                         .unwrap_or_default()
                 })
             }),
-            list(
+            dyn_stack(
                 move || {
                     picker
                         .keys

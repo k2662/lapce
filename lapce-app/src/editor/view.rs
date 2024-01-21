@@ -20,7 +20,9 @@ use floem::{
     style::{CursorStyle, Style},
     taffy::prelude::Node,
     view::{View, ViewData},
-    views::{clip, container, empty, label, list, scroll, stack, svg, Decorators},
+    views::{
+        clip, container, dyn_stack, empty, label, scroll, stack, svg, Decorators,
+    },
     EventPropagation, Renderer,
 };
 use itertools::Itertools;
@@ -392,19 +394,24 @@ pub fn editor_view(
     let config = editor.common.config;
     let sticky_header_height_signal = editor.sticky_header_height;
     let editor2 = editor.clone();
+    let screen_lines = editor.view.screen_lines;
     create_effect(move |last_rev| {
         let config = config.get();
         if !config.editor.sticky_header {
-            return (DocContent::Local, 0, 0, Rect::ZERO);
+            return (DocContent::Local, 0, 0, Rect::ZERO, 0, None);
         }
 
         let doc = doc.get();
         let rect = viewport.get();
+        let (screen_lines_len, screen_lines_first) = screen_lines
+            .with(|lines| (lines.lines.len(), lines.lines.first().copied()));
         let rev = (
             doc.content.get(),
             doc.buffer.with(|b| b.rev()),
             doc.cache_rev.get(),
             rect,
+            screen_lines_len,
+            screen_lines_first,
         );
         if last_rev.as_ref() == Some(&rev) {
             return rev;
@@ -1653,6 +1660,14 @@ impl View for EditorView {
             if self.inner_node.is_none() {
                 self.inner_node = Some(cx.new_node());
             }
+
+            let screen_lines = self.editor.screen_lines().get_untracked();
+            let view = self.editor.view.clone();
+            for (line, _) in screen_lines.iter_lines_y() {
+                // fill in text layout cache so that max width is correct.
+                view.get_text_layout(line);
+            }
+
             let inner_node = self.inner_node.unwrap();
 
             let config = self.editor.common.config.get_untracked();
@@ -2168,7 +2183,7 @@ fn editor_gutter(
         .style(|s| s.height_pct(100.0)),
         clip(
             stack((
-                list(
+                dyn_stack(
                     move || {
                         let num = num_display_lines.get();
                         0..num
@@ -2183,7 +2198,7 @@ fn editor_gutter(
                             as f32,
                     )
                 }),
-                list(
+                dyn_stack(
                     move || {
                         let editor = editor.get();
                         let doc = editor.view.doc.get();
@@ -2333,7 +2348,7 @@ fn editor_breadcrumbs(
             stack((
                 {
                     let workspace = workspace.clone();
-                    list(
+                    dyn_stack(
                         move || {
                             let full_path = doc_path.get().unwrap_or_default();
                             let mut path = full_path;
@@ -2891,6 +2906,7 @@ pub fn changes_colors_screen(
         return Vec::new();
     };
 
+    let line_height = config.editor.line_height();
     let mut line = 0;
     let mut colors = Vec::new();
 
@@ -2907,14 +2923,11 @@ pub fn changes_colors_screen(
                 colors.pop();
             }
 
-            let Some(info) = screen_lines.info_for_line(pre_line) else {
-                continue;
-            };
-
-            let y = info.vline_y;
+            let rvline = view.rvline_of_line(pre_line);
+            let vline = view.vline_of_line(pre_line);
+            let y = (vline.0 * line_height) as f64;
             let height = {
                 // Accumulate the number of line indices each potentially wrapped line spans
-                let rvline = info.vline_info.rvline;
                 let end_line = rvline.line + len;
 
                 view.iter_rvlines_over(false, rvline, end_line).count()
