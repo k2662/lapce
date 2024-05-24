@@ -1,7 +1,6 @@
+use floem::views::editor::text::RenderWhitespace;
 use serde::{Deserialize, Serialize};
 use structdesc::FieldNames;
-
-use crate::doc::RenderWhitespace;
 
 pub const SCALE_OR_SIZE_LIMIT: f64 = 5.0;
 
@@ -49,9 +48,12 @@ impl WrapStyle {
         }
     }
 }
-impl ToString for WrapStyle {
-    fn to_string(&self) -> String {
-        self.as_str().to_string()
+
+impl std::fmt::Display for WrapStyle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())?;
+
+        Ok(())
     }
 }
 
@@ -126,6 +128,11 @@ pub struct EditorConfig {
         desc = "Whether it should format the document on save (if there is an available formatter)"
     )]
     pub format_on_save: bool,
+
+    #[field_names(
+        desc = "Whether newlines should be automatically converted to the current line ending"
+    )]
+    pub normalize_line_endings: bool,
 
     #[field_names(desc = "If matching brackets are highlighted")]
     pub highlight_matching_brackets: bool,
@@ -222,6 +229,10 @@ pub struct EditorConfig {
     pub bracket_pair_colorization: bool,
     #[field_names(desc = "Bracket colorization Limit")]
     pub bracket_colorization_limit: u64,
+    #[field_names(
+        desc = "Glob patterns for excluding files and folders (in file explorer)"
+    )]
+    pub files_exclude: String,
 }
 
 impl EditorConfig {

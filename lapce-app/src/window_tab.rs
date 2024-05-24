@@ -4,19 +4,20 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use crossbeam_channel::Sender;
 use floem::{
-    action::{exec_after, open_file, TimerToken},
+    action::{open_file, TimerToken},
     cosmic_text::{Attrs, AttrsList, FamilyOwned, LineHeightValue, TextLayout},
     ext_event::{create_ext_action, create_signal_from_channel},
     file::FileDialogOptions,
-    keyboard::ModifiersState,
+    keyboard::Modifiers,
     kurbo::Size,
     peniko::kurbo::{Point, Rect, Vec2},
     reactive::{use_context, Memo, ReadSignal, RwSignal, Scope, WriteSignal},
+    ViewId,
 };
 use indexmap::IndexMap;
 use itertools::Itertools;
@@ -27,15 +28,15 @@ use lapce_core::{
 use lapce_rpc::{
     core::CoreNotification,
     dap_types::RunDebugConfig,
-    file::{PathObject, RenameState},
+    file::{Naming, PathObject},
     proxy::{ProxyResponse, ProxyRpcHandler, ProxyStatus},
     source_control::FileDiff,
     terminal::TermId,
     RpcError,
 };
-use lsp_types::{ProgressParams, ProgressToken, ShowMessageParams};
+use lsp_types::{Diagnostic, ProgressParams, ProgressToken, ShowMessageParams};
 use serde_json::Value;
-use tracing::{debug, error};
+use tracing::{debug, error, event, Level};
 
 use crate::{
     about::AboutData,
@@ -49,7 +50,7 @@ use crate::{
     config::LapceConfig,
     db::LapceDb,
     debug::{DapData, LapceBreakpoint, RunDebugMode, RunDebugProcess},
-    doc::{DocContent, DocumentExt, EditorDiagnostic},
+    doc::DocContent,
     editor::location::{EditorLocation, EditorPosition},
     editor_tab::EditorTabChild,
     file_explorer::data::FileExplorerData,
@@ -128,7 +129,7 @@ pub struct CommonData {
     pub term_tx: Sender<(TermId, TermEvent)>,
     pub term_notification_tx: Sender<TermNotification>,
     pub proxy: ProxyRpcHandler,
-    pub view_id: RwSignal<floem::id::Id>,
+    pub view_id: RwSignal<ViewId>,
     pub ui_line_height: Memo<f64>,
     pub dragging: RwSignal<Option<DragContent>>,
     pub config: ReadSignal<Arc<LapceConfig>>,
@@ -136,7 +137,7 @@ pub struct CommonData {
     pub mouse_hover_timer: RwSignal<TimerToken>,
     pub breakpoints: RwSignal<BTreeMap<PathBuf, BTreeMap<usize, LapceBreakpoint>>>,
     // the current focused view which will receive keyboard events
-    pub keyboard_focus: RwSignal<Option<floem::id::Id>>,
+    pub keyboard_focus: RwSignal<Option<ViewId>>,
     pub window_common: Rc<WindowCommonData>,
 }
 
@@ -190,7 +191,7 @@ impl KeyPressFocus for WindowTabData {
         &self,
         command: &LapceCommand,
         _count: Option<usize>,
-        _mods: ModifiersState,
+        _mods: Modifiers,
     ) -> CommandExecuted {
         match &command.kind {
             CommandKind::Workbench(cmd) => {
@@ -271,7 +272,11 @@ impl WindowTabData {
             info
         };
 
-        let config = LapceConfig::load(&workspace, &all_disabled_volts);
+        let config = LapceConfig::load(
+            &workspace,
+            &all_disabled_volts,
+            &window_common.extra_plugin_paths,
+        );
         let lapce_command = Listener::new_empty(cx);
         let workbench_command = Listener::new_empty(cx);
         let internal_command = Listener::new_empty(cx);
@@ -291,6 +296,7 @@ impl WindowTabData {
         let proxy = new_proxy(
             workspace.clone(),
             all_disabled_volts,
+            window_common.extra_plugin_paths.as_ref().clone(),
             config.plugins.clone(),
             term_tx.clone(),
         );
@@ -302,7 +308,7 @@ impl WindowTabData {
         let hover = HoverData::new(cx);
 
         let register = cx.create_rw_signal(Register::default());
-        let view_id = cx.create_rw_signal(floem::id::Id::next());
+        let view_id = cx.create_rw_signal(ViewId::new());
         let find = Find::new(cx);
 
         let ui_line_height = cx.create_memo(move |_| {
@@ -352,8 +358,10 @@ impl WindowTabData {
         let main_split = MainSplitData::new(cx, common.clone());
         let code_action =
             cx.create_rw_signal(CodeActionData::new(cx, common.clone()));
-        let source_control = SourceControlData::new(cx, common.clone());
-        let file_explorer = FileExplorerData::new(cx, common.clone());
+        let source_control =
+            SourceControlData::new(cx, main_split.editors, common.clone());
+        let file_explorer =
+            FileExplorerData::new(cx, main_split.editors, common.clone());
 
         if let Some(info) = workspace_info.as_ref() {
             let root_split = main_split.root_split;
@@ -417,6 +425,13 @@ impl WindowTabData {
                     styles: cx.create_rw_signal(i.panel.styles.clone()),
                     size: cx.create_rw_signal(i.panel.size.clone()),
                     available_size: panel_available_size,
+                    sections: cx.create_rw_signal(
+                        i.panel
+                            .sections
+                            .iter()
+                            .map(|(key, value)| (*key, cx.create_rw_signal(*value)))
+                            .collect(),
+                    ),
                     common: common.clone(),
                 }
             })
@@ -424,11 +439,20 @@ impl WindowTabData {
                 let panel_order = db
                     .get_panel_orders()
                     .unwrap_or_else(|_| default_panel_order());
-                PanelData::new(cx, panel_order, panel_available_size, common.clone())
+                PanelData::new(
+                    cx,
+                    panel_order,
+                    panel_available_size,
+                    im::HashMap::new(),
+                    common.clone(),
+                )
             });
 
-        let terminal =
-            TerminalPanelData::new(workspace.clone(), None, None, common.clone());
+        let terminal = TerminalPanelData::new(
+            workspace.clone(),
+            common.config.get_untracked().terminal.get_default_profile(),
+            common.clone(),
+        );
         if let Some(workspace_info) = workspace_info.as_ref() {
             terminal.debug.breakpoints.set(
                 workspace_info
@@ -448,13 +472,14 @@ impl WindowTabData {
             );
         }
 
-        let rename = RenameData::new(cx, common.clone());
+        let rename = RenameData::new(cx, main_split.editors, common.clone());
         let global_search = GlobalSearchData::new(cx, main_split.clone());
 
         let plugin = PluginData::new(
             cx,
             HashSet::from_iter(disabled_volts),
             HashSet::from_iter(workspace_disabled_volts),
+            main_split.editors,
             common.clone(),
         );
 
@@ -570,7 +595,11 @@ impl WindowTabData {
         let mut all_disabled_volts = disabled_volts;
         all_disabled_volts.extend(workspace_disabled_volts);
 
-        let config = LapceConfig::load(&self.workspace, &all_disabled_volts);
+        let config = LapceConfig::load(
+            &self.workspace,
+            &all_disabled_volts,
+            &self.common.window_common.extra_plugin_paths,
+        );
         self.common.keypress.update(|keypress| {
             keypress.update_keymaps(&config);
         });
@@ -582,14 +611,16 @@ impl WindowTabData {
             CommandKind::Workbench(command) => {
                 self.run_workbench_command(command, cmd.data);
             }
-            CommandKind::Focus(_) | CommandKind::Edit(_) | CommandKind::Move(_) => {
+            CommandKind::Scroll(_)
+            | CommandKind::Focus(_)
+            | CommandKind::Edit(_)
+            | CommandKind::Move(_) => {
                 if self.palette.status.get_untracked() != PaletteStatus::Inactive {
-                    self.palette
-                        .run_command(&cmd, None, ModifiersState::empty());
+                    self.palette.run_command(&cmd, None, Modifiers::empty());
                 } else if let Some(editor_data) =
                     self.main_split.active_editor.get_untracked()
                 {
-                    editor_data.run_command(&cmd, None, ModifiersState::empty());
+                    editor_data.run_command(&cmd, None, Modifiers::empty());
                 } else {
                     // TODO: dispatch to current focused view?
                 }
@@ -622,10 +653,15 @@ impl WindowTabData {
                     let window_command = self.common.window_common.window_command;
                     let options = FileDialogOptions::new().select_directories();
                     open_file(options, move |file| {
-                        if let Some(file) = file {
+                        if let Some(mut file) = file {
                             let workspace = LapceWorkspace {
                                 kind: LapceWorkspaceType::Local,
-                                path: Some(file.path),
+                                path: Some(if let Some(path) = file.path.pop() {
+                                    path
+                                } else {
+                                    tracing::error!("No path");
+                                    return;
+                                }),
                                 last_open: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap()
@@ -653,9 +689,15 @@ impl WindowTabData {
                     let internal_command = self.common.internal_command;
                     let options = FileDialogOptions::new();
                     open_file(options, move |file| {
-                        if let Some(file) = file {
-                            internal_command
-                                .send(InternalCommand::OpenFile { path: file.path })
+                        if let Some(mut file) = file {
+                            internal_command.send(InternalCommand::OpenFile {
+                                path: if let Some(path) = file.path.pop() {
+                                    path
+                                } else {
+                                    tracing::error!("No path");
+                                    return;
+                                },
+                            })
                         }
                     });
                 }
@@ -665,15 +707,14 @@ impl WindowTabData {
             }
             RevealActiveFileInFileExplorer => {
                 if let Some(editor_data) = self.main_split.active_editor.get() {
-                    let path = editor_data.view.doc.with_untracked(|doc| {
-                        if let DocContent::File { path, .. } =
-                            doc.content.get_untracked()
-                        {
-                            Some(path)
-                        } else {
-                            None
-                        }
-                    });
+                    let doc = editor_data.doc();
+                    let path = if let DocContent::File { path, .. } =
+                        doc.content.get_untracked()
+                    {
+                        Some(path)
+                    } else {
+                        None
+                    };
                     let Some(path) = path else { return };
                     let path = path.parent().unwrap_or(&path);
 
@@ -682,25 +723,23 @@ impl WindowTabData {
             }
 
             SaveAll => {
-                self.main_split.editors.with_untracked(|editors| {
+                self.main_split.editors.with_editors_untracked(|editors| {
                     let mut paths = HashSet::new();
                     for (_, editor_data) in editors.iter() {
-                        let should_save =
-                            editor_data.view.doc.with_untracked(|doc| {
-                                let DocContent::File { path, .. } =
-                                    doc.content.get_untracked()
-                                else {
-                                    return false;
-                                };
-
-                                if paths.contains(&path) {
-                                    return false;
-                                }
-
+                        let doc = editor_data.doc();
+                        let should_save = if let DocContent::File { path, .. } =
+                            doc.content.get_untracked()
+                        {
+                            if paths.contains(&path) {
+                                false
+                            } else {
                                 paths.insert(path.clone());
 
                                 true
-                            });
+                            }
+                        } else {
+                            false
+                        };
 
                         if should_save {
                             editor_data.save(true, || {});
@@ -901,7 +940,6 @@ impl WindowTabData {
             // ==== Terminal ====
             NewTerminalTab => {
                 self.terminal.new_tab(
-                    None,
                     self.common
                         .config
                         .get_untracked()
@@ -998,6 +1036,9 @@ impl WindowTabData {
             }
             ChangeFileLanguage => {
                 self.palette.run(PaletteKind::Language);
+            }
+            ChangeFileLineEnding => {
+                self.palette.run(PaletteKind::LineEnding);
             }
             DiffFiles => self.palette.run(PaletteKind::DiffFiles),
 
@@ -1232,9 +1273,23 @@ impl WindowTabData {
 
             // ==== Movement ====
             #[cfg(target_os = "macos")]
-            InstallToPATH => {}
+            InstallToPATH => {
+                self.common.internal_command.send(
+                    InternalCommand::ExecuteProcess {
+                        program: String::from("osascript"),
+                        arguments: vec![String::from("-e"), format!(r#"do shell script "ln -sf '{}' /usr/local/bin/lapce" with administrator privileges"#, std::env::args().next().unwrap())],
+                    }
+                )
+            }
             #[cfg(target_os = "macos")]
-            UninstallFromPATH => {}
+            UninstallFromPATH => {
+                self.common.internal_command.send(
+                    InternalCommand::ExecuteProcess {
+                        program: String::from("osascript"),
+                        arguments: vec![String::from("-e"), String::from(r#"do shell script "rm /usr/local/bin/lapce" with administrator privileges"#)],
+                    }
+                )
+            }
             JumpLocationForward => {
                 self.main_split.jump_location_forward(false);
             }
@@ -1299,25 +1354,20 @@ impl WindowTabData {
             InternalCommand::OpenFileChanges { path } => {
                 self.main_split.open_file_changes(path);
             }
-            InternalCommand::StartRenamePath { path } => {
-                self.file_explorer.rename_state.set(RenameState::Renaming {
-                    path,
-                    editor_needs_reset: true,
-                });
+            InternalCommand::ReloadFileExplorer => {
+                self.file_explorer.reload();
             }
-            InternalCommand::TestRenamePath { new_path } => {
-                let rename_state = self.file_explorer.rename_state;
+            InternalCommand::TestPathCreation { new_path } => {
+                let naming = self.file_explorer.naming;
 
                 let send = create_ext_action(
                     self.scope,
                     move |response: Result<ProxyResponse, RpcError>| match response {
                         Ok(_) => {
-                            rename_state.update(RenameState::set_ok);
+                            naming.update(Naming::set_ok);
                         }
                         Err(err) => {
-                            rename_state.update(|rename_state| {
-                                rename_state.set_err(err.message)
-                            });
+                            naming.update(|naming| naming.set_err(err.message));
                         }
                     },
                 );
@@ -1353,15 +1403,10 @@ impl WindowTabData {
                             // file the renamed directory is an ancestor of is open to use the
                             // file's new path.
                             let renamed_editors_content: Vec<_> = editors
-                                .with_untracked(|editors| {
+                                .with_editors_untracked(|editors| {
                                     editors
                                         .values()
-                                        .map(|editor| {
-                                            editor
-                                                .view
-                                                .doc
-                                                .with_untracked(|doc| doc.content)
-                                        })
+                                        .map(|editor| editor.doc().content)
                                         .filter(|content| {
                                             content.with_untracked(|content| {
                                                 match content {
@@ -1391,22 +1436,79 @@ impl WindowTabData {
                             }
 
                             file_explorer.reload();
-                            file_explorer.rename_state.set(RenameState::NotRenaming);
+                            file_explorer.naming.set(Naming::None);
                         }
                         Err(err) => {
-                            file_explorer.rename_state.update(|rename_state| {
-                                rename_state.set_err(err.message)
-                            });
+                            file_explorer
+                                .naming
+                                .update(|naming| naming.set_err(err.message));
                         }
                     },
                 );
 
-                self.file_explorer
-                    .rename_state
-                    .update(RenameState::set_pending);
+                self.file_explorer.naming.update(Naming::set_pending);
                 self.common
                     .proxy
                     .rename_path(current_path.clone(), new_path, send);
+            }
+            InternalCommand::FinishNewNode { is_dir, path } => {
+                let file_explorer = self.file_explorer.clone();
+                let internal_command = self.common.internal_command;
+
+                let send = create_ext_action(
+                    self.scope,
+                    move |response: Result<ProxyResponse, RpcError>| {
+                        match response {
+                            Ok(response) => {
+                                file_explorer.reload();
+                                file_explorer.naming.set(Naming::None);
+
+                                // Open a new file in the editor
+                                if let ProxyResponse::CreatePathResponse { path } =
+                                    response
+                                {
+                                    if !is_dir {
+                                        internal_command.send(
+                                            InternalCommand::OpenFile { path },
+                                        );
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                file_explorer
+                                    .naming
+                                    .update(|naming| naming.set_err(err.message));
+                            }
+                        }
+                    },
+                );
+
+                self.file_explorer.naming.update(Naming::set_pending);
+                if is_dir {
+                    self.common.proxy.create_directory(path, send);
+                } else {
+                    self.common.proxy.create_file(path, send);
+                }
+            }
+            InternalCommand::FinishDuplicate { source, path } => {
+                let file_explorer = self.file_explorer.clone();
+
+                let send = create_ext_action(
+                    self.scope,
+                    move |response: Result<_, RpcError>| {
+                        if let Err(err) = response {
+                            file_explorer
+                                .naming
+                                .update(|naming| naming.set_err(err.message));
+                        } else {
+                            file_explorer.reload();
+                            file_explorer.naming.set(Naming::None);
+                        }
+                    },
+                );
+
+                self.file_explorer.naming.update(Naming::set_pending);
+                self.common.proxy.duplicate_path(source, path, send);
             }
             InternalCommand::GoToLocation { location } => {
                 self.main_split.go_to_location(location, None);
@@ -1467,7 +1569,7 @@ impl WindowTabData {
                     .save_jump_location(path, offset, scroll_offset);
             }
             InternalCommand::NewTerminal { profile } => {
-                self.terminal.new_tab(None, profile);
+                self.terminal.new_tab(profile);
             }
             InternalCommand::SplitTerminal { term_id } => {
                 self.terminal.split(term_id);
@@ -1584,6 +1686,9 @@ impl WindowTabData {
             InternalCommand::SaveScratchDoc { doc } => {
                 self.main_split.save_scratch_doc(doc);
             }
+            InternalCommand::SaveScratchDoc2 { doc } => {
+                self.main_split.save_scratch_doc2(doc);
+            }
             InternalCommand::UpdateProxyStatus { status } => {
                 self.common.proxy_status.set(Some(status));
             }
@@ -1594,47 +1699,34 @@ impl WindowTabData {
                 self.main_split.open_volt_view(volt_id);
             }
             InternalCommand::ResetBlinkCursor => {
-                if self.common.window_common.hide_cursor.get_untracked() {
-                    self.common.window_common.hide_cursor.set(false);
+                // All the editors share the blinking information and logic, so we can just reset
+                // one of them.
+                if let Some(e_data) = self.main_split.active_editor.get_untracked() {
+                    e_data.editor.cursor_info.reset();
                 }
-                self.common
-                    .window_common
-                    .cursor_blink_timer
-                    .set(TimerToken::INVALID);
-
-                let should_blink = {
-                    let focus = self.common.focus;
-                    let keyboard_focus = self.common.keyboard_focus;
-                    move || {
-                        let focus = focus.get_untracked();
-                        if matches!(
-                            focus,
-                            Focus::Workbench
-                                | Focus::Palette
-                                | Focus::Panel(PanelKind::Plugin)
-                                | Focus::Panel(PanelKind::Search)
-                                | Focus::Panel(PanelKind::SourceControl)
-                        ) {
-                            return true;
-                        }
-                        if keyboard_focus.get_untracked().is_some() {
-                            return true;
-                        }
-                        false
-                    }
-                };
-
-                blink_cursor(
-                    self.common.window_common.cursor_blink_timer,
-                    self.common.window_common.hide_cursor,
-                    should_blink,
-                    self.common.config,
-                );
             }
             InternalCommand::OpenDiffFiles {
                 left_path,
                 right_path,
             } => self.main_split.open_diff_files(left_path, right_path),
+            InternalCommand::ExecuteProcess { program, arguments } => {
+                let mut cmd = match std::process::Command::new(program)
+                    .args(arguments)
+                    .spawn()
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return event!(Level::ERROR, "Failed to spawn process: {e}")
+                    }
+                };
+
+                match cmd.wait() {
+                    Ok(v) => event!(Level::TRACE, "Process exited with status {v}"),
+                    Err(e) => {
+                        event!(Level::ERROR, "Proces exited with an error: {e}")
+                    }
+                };
+            }
         }
     }
 
@@ -1682,30 +1774,23 @@ impl WindowTabData {
                 });
 
                 let completion = self.common.completion.get_untracked();
-                let editor_data = completion.latest_editor_id.and_then(|id| {
-                    self.main_split
-                        .editors
-                        .with_untracked(|tabs| tabs.get(&id).cloned())
-                });
+                let editor_data = completion
+                    .latest_editor_id
+                    .and_then(|id| self.main_split.editors.editor_untracked(id));
                 if let Some(editor_data) = editor_data {
                     let cursor_offset =
-                        editor_data.cursor.with_untracked(|c| c.offset());
-                    completion.update_document_completion(
-                        &editor_data.view,
-                        cursor_offset,
-                    );
+                        editor_data.cursor().with_untracked(|c| c.offset());
+                    completion
+                        .update_document_completion(&editor_data, cursor_offset);
                 }
             }
             CoreNotification::PublishDiagnostics { diagnostics } => {
                 let path = path_from_url(&diagnostics.uri);
-                let diagnostics: im::Vector<EditorDiagnostic> = diagnostics
+                let diagnostics: im::Vector<Diagnostic> = diagnostics
                     .diagnostics
-                    .iter()
-                    .map(|d| EditorDiagnostic {
-                        range: (0, 0),
-                        diagnostic: d.clone(),
-                    })
-                    .sorted_by_key(|d| d.diagnostic.range.start)
+                    .clone()
+                    .into_iter()
+                    .sorted_by_key(|d| d.range.start)
                     .collect();
 
                 self.main_split
@@ -1782,8 +1867,9 @@ impl WindowTabData {
                             if let Some(breakpoint) = breakpoints.get(i) {
                                 current_breakpoint.id = breakpoint.id;
                                 current_breakpoint.verified = breakpoint.verified;
-                                current_breakpoint.message =
-                                    breakpoint.message.clone();
+                                current_breakpoint
+                                    .message
+                                    .clone_from(&breakpoint.message);
                                 if let Some(new_line) = breakpoint.line {
                                     if current_breakpoint.line + 1 != new_line {
                                         line_changed.insert(current_breakpoint.line);
@@ -1818,27 +1904,55 @@ impl WindowTabData {
             CoreNotification::ShowMessage { title, message } => {
                 self.show_message(title, message);
             }
-            CoreNotification::Log { level, message } => {
-                match level.as_str() {
-                    "TRACE" => {
-                        tracing::trace!(message);
+            CoreNotification::Log {
+                level,
+                message,
+                target,
+            } => {
+                use lapce_rpc::core::LogLevel;
+                use tracing_log::log::{log, Level};
+
+                let target = target.clone().unwrap_or(String::from("unknown"));
+
+                match level {
+                    LogLevel::Trace => {
+                        log!(target: &target, Level::Trace, "{}", message);
                     }
-                    "DEBUG" => {
-                        tracing::debug!(message);
+                    LogLevel::Debug => {
+                        log!(target: &target, Level::Debug, "{}", message);
                     }
-                    "INFO" => {
-                        tracing::info!(message);
+                    LogLevel::Info => {
+                        log!(target: &target, Level::Info, "{}", message);
                     }
-                    "WARN" => {
-                        tracing::warn!(message);
+                    LogLevel::Warn => {
+                        log!(target: &target, Level::Warn, "{}", message);
                     }
-                    "ERROR" => {
-                        tracing::error!(message);
+                    LogLevel::Error => {
+                        log!(target: &target, Level::Error, "{}", message);
                     }
-                    _ => {
-                        tracing::debug!(message);
+                }
+            }
+            CoreNotification::LogMessage { message, target } => {
+                use lsp_types::MessageType;
+                use tracing_log::log::{log, Level};
+                match message.typ {
+                    MessageType::ERROR => {
+                        log!(target: target, Level::Error, "{}", message.message)
                     }
-                };
+                    MessageType::WARNING => {
+                        log!(target: target, Level::Warn, "{}", message.message)
+                    }
+                    MessageType::INFO => {
+                        log!(target: target, Level::Info, "{}", message.message)
+                    }
+                    MessageType::DEBUG => {
+                        log!(target: target, Level::Debug, "{}", message.message)
+                    }
+                    MessageType::LOG => {
+                        log!(target: target, Level::Debug, "{}", message.message)
+                    }
+                    _ => {}
+                }
             }
             CoreNotification::WorkspaceFileChange => {
                 self.file_explorer.reload();
@@ -1916,16 +2030,16 @@ impl WindowTabData {
         }
 
         let editor_id = self.common.hover.editor_id.get_untracked();
-        let editor = self
-            .main_split
-            .editors
-            .with(|editors| editors.get(&editor_id).cloned())?;
+        let editor_data = self.main_split.editors.editor(editor_id)?;
 
-        let (window_origin, viewport, view) =
-            (editor.window_origin, editor.viewport, editor.view.clone());
+        let (window_origin, viewport, editor) = (
+            editor_data.window_origin(),
+            editor_data.viewport(),
+            &editor_data.editor,
+        );
 
         // TODO(minor): affinity should be gotten from where the hover was started at.
-        let (point_above, point_below) = view.points_of_offset(
+        let (point_above, point_below) = editor.points_of_offset(
             self.common.hover.offset.get_untracked(),
             CursorAffinity::Forward,
         );
@@ -1960,20 +2074,23 @@ impl WindowTabData {
             return Point::ZERO;
         }
         let config = self.common.config.get();
-        let editor =
+        let editor_data =
             if let Some(editor) = self.main_split.active_editor.get_untracked() {
                 editor
             } else {
                 return Point::ZERO;
             };
 
-        let (window_origin, viewport, view) =
-            (editor.window_origin, editor.viewport, editor.view.clone());
+        let (window_origin, viewport, editor) = (
+            editor_data.window_origin(),
+            editor_data.viewport(),
+            &editor_data.editor,
+        );
 
         // TODO(minor): What affinity should we use for this? Probably just use the cursor's
         // original affinity..
         let (point_above, point_below) =
-            view.points_of_offset(completion.offset, CursorAffinity::Forward);
+            editor.points_of_offset(completion.offset, CursorAffinity::Forward);
 
         let window_origin =
             window_origin.get() - self.common.window_origin.get().to_vec2();
@@ -2013,19 +2130,22 @@ impl WindowTabData {
         let tab_size = self.layout_rect.get().size();
         let code_action_size = code_action.layout_rect.size();
 
-        let editor =
+        let editor_data =
             if let Some(editor) = self.main_split.active_editor.get_untracked() {
                 editor
             } else {
                 return Point::ZERO;
             };
 
-        let (window_origin, viewport, view) =
-            (editor.window_origin, editor.viewport, editor.view.clone());
+        let (window_origin, viewport, editor) = (
+            editor_data.window_origin(),
+            editor_data.viewport(),
+            &editor_data.editor,
+        );
 
         // TODO(minor): What affinity should we use for this?
         let (_point_above, point_below) =
-            view.points_of_offset(code_action.offset, CursorAffinity::Forward);
+            editor.points_of_offset(code_action.offset, CursorAffinity::Forward);
 
         let window_origin =
             window_origin.get() - self.common.window_origin.get().to_vec2();
@@ -2065,18 +2185,21 @@ impl WindowTabData {
         let tab_size = self.layout_rect.get().size();
         let rename_size = self.rename.layout_rect.get().size();
 
-        let editor =
+        let editor_data =
             if let Some(editor) = self.main_split.active_editor.get_untracked() {
                 editor
             } else {
                 return Point::ZERO;
             };
 
-        let (window_origin, viewport, view) =
-            (editor.window_origin, editor.viewport, editor.view.clone());
+        let (window_origin, viewport, editor) = (
+            editor_data.window_origin(),
+            editor_data.viewport(),
+            &editor_data.editor,
+        );
 
         // TODO(minor): What affinity should we use for this?
-        let (_point_above, point_below) = view.points_of_offset(
+        let (_point_above, point_below) = editor.points_of_offset(
             self.rename.start.get_untracked(),
             CursorAffinity::Forward,
         );
@@ -2109,7 +2232,7 @@ impl WindowTabData {
                 self.main_split
                     .active_editor
                     .get()
-                    .map(|editor| editor.cursor.with(|c| c.get_mode()))
+                    .map(|editor| editor.cursor().with(|c| c.get_mode()))
             } else {
                 None
             };
@@ -2206,7 +2329,7 @@ impl WindowTabData {
                 .tab_info
                 .with_untracked(|info| info.tabs.is_empty())
         {
-            self.terminal.new_tab(None, None);
+            self.terminal.new_tab(None);
         }
         self.panel.show_panel(&kind);
         if kind == PanelKind::Search
@@ -2268,7 +2391,7 @@ impl WindowTabData {
 
             terminal.term_id
         } else {
-            let new_terminal_tab = self.terminal.new_tab(
+            let new_terminal_tab = self.terminal.new_tab_run_debug(
                 Some(RunDebugProcess {
                     mode: *mode,
                     config: config.clone(),
@@ -2362,14 +2485,14 @@ impl WindowTabData {
                 lsp_types::WorkDoneProgress::Report(report) => {
                     self.progresses.update(|p| {
                         if let Some(progress) = p.get_mut(&token) {
-                            progress.message = report.message.clone();
+                            progress.message.clone_from(&report.message);
                             progress.percentage = report.percentage;
                         }
                     })
                 }
                 lsp_types::WorkDoneProgress::End(_) => {
                     self.progresses.update(|p| {
-                        p.remove(&token);
+                        p.swap_remove(&token);
                     });
                 }
             },
@@ -2380,33 +2503,6 @@ impl WindowTabData {
         self.messages.update(|messages| {
             messages.push((title.to_string(), message.clone()));
         });
-    }
-}
-
-fn blink_cursor(
-    cursor_blink_timer: RwSignal<TimerToken>,
-    hide_cursor: RwSignal<bool>,
-    should_blink: impl Fn() -> bool + 'static + Copy,
-    config: ReadSignal<Arc<LapceConfig>>,
-) {
-    let blink_interval =
-        config.with_untracked(|config| config.editor.blink_interval());
-    if blink_interval > 0 && should_blink() {
-        let timer_token =
-            exec_after(Duration::from_millis(blink_interval), move |timer_token| {
-                if cursor_blink_timer.try_get_untracked() == Some(timer_token) {
-                    hide_cursor.update(|hide| {
-                        *hide = !*hide;
-                    });
-                    blink_cursor(
-                        cursor_blink_timer,
-                        hide_cursor,
-                        should_blink,
-                        config,
-                    );
-                }
-            });
-        cursor_blink_timer.set(timer_token);
     }
 }
 

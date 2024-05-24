@@ -24,7 +24,7 @@ use lsp_types::{
     notification::Initialized, request::Initialize, DocumentFilter,
     InitializeParams, InitializedParams, TextDocumentContentChangeEvent,
     TextDocumentIdentifier, Url, VersionedTextDocumentIdentifier,
-    WorkDoneProgressParams,
+    WorkDoneProgressParams, WorkspaceFolder,
 };
 use parking_lot::Mutex;
 use psp_types::{Notification, Request};
@@ -198,13 +198,18 @@ impl Plugin {
             InitializeParams {
                 process_id: Some(process::id()),
                 root_path: None,
-                root_uri,
+                root_uri: root_uri.clone(),
                 capabilities: client_capabilities(),
                 trace: None,
                 client_info: None,
                 locale: None,
                 initialization_options: configurations,
-                workspace_folders: None,
+                workspace_folders: root_uri.map(|uri| {
+                    vec![WorkspaceFolder {
+                        name: uri.as_str().to_string(),
+                        uri,
+                    }]
+                }),
                 work_done_progress_params: WorkDoneProgressParams::default(),
             },
             None,
@@ -234,9 +239,10 @@ impl Plugin {
 
 pub fn load_all_volts(
     plugin_rpc: PluginCatalogRpcHandler,
+    extra_plugin_paths: &[PathBuf],
     disabled_volts: Vec<VoltID>,
 ) {
-    let all_volts = find_all_volts();
+    let all_volts = find_all_volts(extra_plugin_paths);
     let volts = all_volts
         .into_iter()
         .filter_map(|meta| {
@@ -252,25 +258,62 @@ pub fn load_all_volts(
     let _ = plugin_rpc.unactivated_volts(volts);
 }
 
-pub fn find_all_volts() -> Vec<VoltMetadata> {
-    Directory::plugins_directory()
-        .and_then(|d| {
-            d.read_dir().ok().map(|dir| {
-                dir.filter_map(|result| {
-                    let entry = result.ok()?;
-                    let metadata = entry.metadata().ok()?;
+/// Find all installed volts.  
+/// `plugin_dev_path` allows launching Lapce with a plugin on your local system for testing
+/// purposes.  
+/// As well, this function skips any volt in the typical plugin directory that match the name
+/// of the dev plugin so as to support developing a plugin you actively use.
+pub fn find_all_volts(extra_plugin_paths: &[PathBuf]) -> Vec<VoltMetadata> {
+    let Some(plugin_dir) = Directory::plugins_directory() else {
+        return Vec::new();
+    };
 
-                    if metadata.is_file()
-                        || entry.file_name().to_str()?.starts_with('.')
-                    {
-                        return None;
-                    }
-                    load_volt(&entry.path()).ok()
-                })
-                .collect()
-            })
+    let mut plugins: Vec<VoltMetadata> = plugin_dir
+        .read_dir()
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|result| {
+            let entry = result.ok()?;
+            let metadata = entry.metadata().ok()?;
+
+            // Ignore any loose files or '.' prefixed hidden directories
+            if metadata.is_file() || entry.file_name().to_str()?.starts_with('.') {
+                return None;
+            }
+
+            Some(entry.path())
         })
-        .unwrap_or_default()
+        .filter_map(|path| match load_volt(&path) {
+            Ok(metadata) => Some(metadata),
+            Err(e) => {
+                tracing::error!("Failed to load plugin: {:?}", e);
+                None
+            }
+        })
+        .collect();
+
+    for plugin_path in extra_plugin_paths {
+        let mut metadata = match load_volt(plugin_path) {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                tracing::error!("Failed to load extra plugin: {:?}", e);
+                continue;
+            }
+        };
+
+        let pos = plugins.iter().position(|meta| {
+            meta.name == metadata.name && meta.author == metadata.author
+        });
+
+        if let Some(pos) = pos {
+            std::mem::swap(&mut plugins[pos], &mut metadata);
+        } else {
+            plugins.push(metadata);
+        }
+    }
+
+    plugins
 }
 
 /// Returns an instance of "VoltMetadata" or an error if there is no file in the path,
@@ -456,9 +499,10 @@ pub fn start_volt(
             }
         }
     })?;
+    let plugin_meta = meta.clone();
     linker.func_wrap("lapce", "host_handle_stderr", move || {
         if let Ok(msg) = wasi_read_string(&stderr) {
-            eprintln!("got stderr from plugin: {msg}");
+            tracing_log::log::log!(target: &format!("lapce_proxy::plugin::wasi::{}::{}", plugin_meta.author, plugin_meta.name), tracing_log::log::Level::Debug, "{msg}");
         }
     })?;
     linker.module(&mut store, "", &module)?;

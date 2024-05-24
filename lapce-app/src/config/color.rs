@@ -11,6 +11,10 @@ pub enum LoadThemeError {
         themes_folder: PathBuf,
         theme_name: String,
     },
+    #[error("recursion limit reached for {variable_name}")]
+    RecursionLimitReached { variable_name: String },
+    #[error("variable {variable_name} not found")]
+    VariableNotFound { variable_name: String },
     #[error("There was an error reading the theme file")]
     Read(std::io::Error),
 }
@@ -137,6 +141,9 @@ impl LapceColor {
 
     pub const DEBUG_BREAKPOINT: &'static str = "debug.breakpoint";
     pub const DEBUG_BREAKPOINT_HOVER: &'static str = "debug.breakpoint.hover";
+
+    pub const TOOLTIP_BACKGROUND: &'static str = "tooltip.background";
+    pub const TOOLTIP_FOREGROUND: &'static str = "tooltip.foreground";
 
     pub const PANEL_BACKGROUND: &'static str = "panel.background";
     pub const PANEL_FOREGROUND: &'static str = "panel.foreground";

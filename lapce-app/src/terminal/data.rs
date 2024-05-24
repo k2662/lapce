@@ -1,4 +1,4 @@
-use std::{path::PathBuf, rc::Rc, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, rc::Rc, sync::Arc};
 
 use alacritty_terminal::{
     grid::{Dimensions, Scroll},
@@ -7,12 +7,14 @@ use alacritty_terminal::{
     vi_mode::ViMotion,
     Term,
 };
+use anyhow::anyhow;
 use floem::{
-    keyboard::{Key, KeyEvent, ModifiersState, NamedKey},
+    keyboard::{Key, KeyEvent, Modifiers, NamedKey},
     reactive::{RwSignal, Scope},
+    views::editor::text::SystemClipboard,
 };
 use lapce_core::{
-    command::{EditCommand, FocusCommand},
+    command::{EditCommand, FocusCommand, ScrollCommand},
     mode::{Mode, VisualMode},
     movement::{LinePosition, Movement},
     register::Clipboard,
@@ -22,6 +24,7 @@ use lapce_rpc::{
     terminal::{TermId, TerminalProfile},
 };
 use parking_lot::RwLock;
+use url::Url;
 
 use super::{
     event::TermEvent,
@@ -30,7 +33,6 @@ use super::{
 use crate::{
     command::{CommandExecuted, CommandKind, InternalCommand},
     debug::RunDebugProcess,
-    doc::SystemClipboard,
     keypress::{condition::Condition, KeyPressFocus},
     window_tab::CommonData,
     workspace::LapceWorkspace,
@@ -63,7 +65,7 @@ impl KeyPressFocus for TerminalData {
         &self,
         command: &crate::command::LapceCommand,
         count: Option<usize>,
-        _mods: ModifiersState,
+        _mods: Modifiers,
     ) -> crate::command::CommandExecuted {
         self.common.view_id.get_untracked().request_paint();
         let config = self.common.config.get_untracked();
@@ -195,8 +197,8 @@ impl KeyPressFocus for TerminalData {
                 }
                 _ => return CommandExecuted::No,
             },
-            CommandKind::Focus(cmd) => match cmd {
-                FocusCommand::PageUp => {
+            CommandKind::Scroll(cmd) => match cmd {
+                ScrollCommand::PageUp => {
                     let raw = self.raw.get_untracked();
                     let mut raw = raw.write();
                     let term = &mut raw.term;
@@ -208,7 +210,7 @@ impl KeyPressFocus for TerminalData {
                         scroll_lines,
                     ));
                 }
-                FocusCommand::PageDown => {
+                ScrollCommand::PageDown => {
                     let raw = self.raw.get_untracked();
                     let mut raw = raw.write();
                     let term = &mut raw.term;
@@ -220,6 +222,9 @@ impl KeyPressFocus for TerminalData {
                         scroll_lines,
                     ));
                 }
+                _ => return CommandExecuted::No,
+            },
+            CommandKind::Focus(cmd) => match cmd {
                 FocusCommand::SplitVertical => {
                     self.common.internal_command.send(
                         InternalCommand::SplitTerminal {
@@ -302,6 +307,15 @@ impl TerminalData {
     pub fn new(
         cx: Scope,
         workspace: Arc<LapceWorkspace>,
+        profile: Option<TerminalProfile>,
+        common: Rc<CommonData>,
+    ) -> Self {
+        Self::new_run_debug(cx, workspace, None, profile, common)
+    }
+
+    pub fn new_run_debug(
+        cx: Scope,
+        workspace: Arc<LapceWorkspace>,
         run_debug: Option<RunDebugProcess>,
         profile: Option<TerminalProfile>,
         common: Rc<CommonData>,
@@ -315,19 +329,21 @@ impl TerminalData {
             cx.create_rw_signal(String::from("Default"))
         };
 
+        let launch_error = cx.create_rw_signal(None);
+
         let raw = Self::new_raw_terminal(
-            workspace.clone(),
+            &workspace,
             term_id,
-            run_debug.as_ref().map(|r| (&r.config, r.is_prelaunch)),
+            run_debug.as_ref(),
             profile,
             common.clone(),
+            launch_error,
         );
 
         let run_debug = cx.create_rw_signal(run_debug);
         let mode = cx.create_rw_signal(Mode::Terminal);
         let visual_mode = cx.create_rw_signal(VisualMode::Normal);
         let raw = cx.create_rw_signal(raw);
-        let launch_error = cx.create_rw_signal(None);
 
         Self {
             scope: cx,
@@ -343,12 +359,13 @@ impl TerminalData {
         }
     }
 
-    pub fn new_raw_terminal(
-        workspace: Arc<LapceWorkspace>,
+    fn new_raw_terminal(
+        workspace: &LapceWorkspace,
         term_id: TermId,
-        run_debug: Option<(&RunDebugConfig, bool)>,
+        run_debug: Option<&RunDebugProcess>,
         profile: Option<TerminalProfile>,
         common: Rc<CommonData>,
+        launch_error: RwSignal<Option<String>>,
     ) -> Arc<RwLock<RawTerminal>> {
         let raw = Arc::new(RwLock::new(RawTerminal::new(
             term_id,
@@ -368,51 +385,37 @@ impl TerminalData {
             };
         }
 
-        if let Some((run_debug, is_prelaunch)) = run_debug {
-            if let Some(path) = run_debug.cwd.as_ref() {
-                if let Ok(as_url) = url::Url::from_file_path(PathBuf::from(path)) {
-                    profile.workdir = Some(as_url);
-                }
-                if path.contains("${workspace}") {
-                    if let Some(workspace) = workspace
-                        .path
-                        .as_ref()
-                        .and_then(|workspace| workspace.to_str())
-                    {
-                        if let Ok(as_url) = url::Url::from_file_path(PathBuf::from(
-                            &path.replace("${workspace}", workspace),
-                        )) {
-                            profile.workdir = Some(as_url);
-                        }
-                    }
-                }
+        let exp_run_debug = run_debug
+            .as_ref()
+            .map(|run_debug| {
+                ExpandedRunDebug::expand(
+                    workspace,
+                    &run_debug.config,
+                    run_debug.is_prelaunch,
+                )
+            })
+            .transpose();
+
+        let exp_run_debug = exp_run_debug.unwrap_or_else(|e| {
+            let r_name = run_debug
+                .as_ref()
+                .map(|r| r.config.name.as_str())
+                .unwrap_or("Unknown");
+            launch_error.set(Some(format!(
+                "Failed to expand variables in run debug definition {r_name}: {e}"
+            )));
+            None
+        });
+
+        if let Some(run_debug) = exp_run_debug {
+            if let Some(work_dir) = run_debug.work_dir {
+                profile.workdir = Some(work_dir);
             }
 
-            let prelaunch = if is_prelaunch {
-                run_debug.prelaunch.clone()
-            } else {
-                None
-            };
+            profile.environment = run_debug.env;
 
-            profile.environment = run_debug.env.clone();
-
-            if let Some(debug_command) = run_debug.debug_command.as_ref() {
-                let mut args = debug_command.to_owned();
-                let command = args.first().cloned().unwrap_or_default();
-                if !args.is_empty() {
-                    args.remove(0);
-                }
-                profile.command = Some(command);
-                if !args.is_empty() {
-                    profile.arguments = Some(args);
-                }
-            } else if let Some(prelaunch) = prelaunch {
-                profile.command = Some(prelaunch.program);
-                profile.arguments = prelaunch.args;
-            } else {
-                profile.command = Some(run_debug.program.clone());
-                profile.arguments = run_debug.args.clone();
-            }
+            profile.command = Some(run_debug.program);
+            profile.arguments = run_debug.args;
         }
 
         {
@@ -420,6 +423,7 @@ impl TerminalData {
             let _ = common.term_tx.send((term_id, TermEvent::NewTerminal(raw)));
             common.proxy.new_terminal(term_id, profile);
         }
+
         raw
     }
 
@@ -438,15 +442,15 @@ impl TerminalData {
         // Generates a `Modifiers` value to check against.
         macro_rules! modifiers {
             (ctrl) => {
-                ModifiersState::CONTROL
+                Modifiers::CONTROL
             };
 
             (alt) => {
-                ModifiersState::ALT
+                Modifiers::ALT
             };
 
             (shift) => {
-                ModifiersState::SHIFT
+                Modifiers::SHIFT
             };
 
             ($mod:ident $(| $($mods:ident)|+)?) => {
@@ -520,7 +524,7 @@ impl TerminalData {
 
         match key.key.logical_key {
             Key::Character(ref c) => {
-                if key.modifiers == ModifiersState::CONTROL {
+                if key.modifiers == Modifiers::CONTROL {
                     // Convert the character into its index (into a control character).
                     // In essence, this turns `ctrl+h` into `^h`
                     let str = match c.as_str() {
@@ -565,9 +569,9 @@ impl TerminalData {
                 }
             }
             Key::Named(NamedKey::Backspace) => {
-                Some(if key.modifiers.control_key() {
+                Some(if key.modifiers.control() {
                     "\x08" // backspace
-                } else if key.modifiers.alt_key() {
+                } else if key.modifiers.alt() {
                     "\x1b\x7f"
                 } else {
                     "\x7f"
@@ -709,11 +713,12 @@ impl TerminalData {
         };
 
         let raw = Self::new_raw_terminal(
-            self.workspace.clone(),
+            &self.workspace,
             self.term_id,
-            run_debug.as_ref().map(|r| (&r.config, r.is_prelaunch)),
+            run_debug.as_ref(),
             None,
             self.common.clone(),
+            self.launch_error,
         );
 
         self.raw.set(raw);
@@ -724,5 +729,94 @@ impl TerminalData {
         self.common
             .proxy
             .terminal_resize(self.term_id, width, height);
+    }
+}
+
+/// [`RunDebugConfig`] with expanded out program/arguments/etc. Used for creating the terminal.
+#[derive(Debug, Clone)]
+pub struct ExpandedRunDebug {
+    pub work_dir: Option<Url>,
+    pub env: Option<HashMap<String, String>>,
+    pub program: String,
+    pub args: Option<Vec<String>>,
+}
+impl ExpandedRunDebug {
+    pub fn expand(
+        workspace: &LapceWorkspace,
+        run_debug: &RunDebugConfig,
+        is_prelaunch: bool,
+    ) -> anyhow::Result<Self> {
+        // Get the current working directory variable, which can container ${workspace}
+        let work_dir = Self::expand_work_dir(workspace, run_debug);
+
+        let prelaunch = is_prelaunch
+            .then_some(run_debug.prelaunch.as_ref())
+            .flatten();
+
+        let env = run_debug.env.clone();
+
+        // TODO: replace some variables in the args
+        let (program, mut args) =
+            if let Some(debug_command) = run_debug.debug_command.as_ref() {
+                let mut args = debug_command.to_owned();
+                let command = args.first().cloned().unwrap_or_default();
+                if !args.is_empty() {
+                    args.remove(0);
+                }
+
+                let args = if !args.is_empty() { Some(args) } else { None };
+                (command, args)
+            } else if let Some(prelaunch) = prelaunch {
+                (prelaunch.program.clone(), prelaunch.args.clone())
+            } else {
+                (run_debug.program.clone(), run_debug.args.clone())
+            };
+
+        let program = if program == "${lapce}" {
+            std::env::current_exe().map_err(|e| {
+                anyhow!("Failed to get current exe for ${{lapce}} run and debug: {e}")
+            })?.to_str().ok_or_else(|| anyhow!("Failed to convert ${{lapce}} path to str"))?.to_string()
+        } else {
+            program
+        };
+
+        if let Some(args) = &mut args {
+            for arg in args {
+                // Replace all mentions of ${workspace} with the current workspace path
+                if arg.contains("${workspace}") {
+                    if let Some(workspace) =
+                        workspace.path.as_ref().and_then(|x| x.to_str())
+                    {
+                        *arg = arg.replace("${workspace}", workspace);
+                    }
+                }
+            }
+        }
+
+        Ok(ExpandedRunDebug {
+            work_dir,
+            env,
+            program,
+            args,
+        })
+    }
+
+    fn expand_work_dir(
+        workspace: &LapceWorkspace,
+        run_debug: &RunDebugConfig,
+    ) -> Option<Url> {
+        let path = run_debug.cwd.as_ref()?;
+
+        if path.contains("${workspace}") {
+            if let Some(workspace) = workspace.path.as_ref().and_then(|x| x.to_str())
+            {
+                let path = path.replace("${workspace}", workspace);
+                if let Ok(as_url) = Url::from_file_path(PathBuf::from(path)) {
+                    return Some(as_url);
+                }
+            }
+        }
+
+        Url::from_file_path(PathBuf::from(path)).ok()
     }
 }

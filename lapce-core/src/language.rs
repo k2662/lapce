@@ -6,7 +6,7 @@ use std::{
 
 use lapce_rpc::style::{LineStyle, Style};
 use once_cell::sync::Lazy;
-use strum_macros::{AsRefStr, AsStaticStr, Display, EnumMessage, EnumString};
+use strum_macros::{AsRefStr, Display, EnumMessage, EnumString, IntoStaticStr};
 use tracing::{debug, error};
 use tree_sitter::{Point, TreeCursor};
 
@@ -99,7 +99,7 @@ struct TreeSitterProperties {
     query: Option<&'static str>,
     /// Lists of tree-sitter node types that control how code lenses are built.
     /// The first is a list of nodes that should be traversed and included in
-    /// the lens, along with thier children. The second is a list of nodes that
+    /// the lens, along with their children. The second is a list of nodes that
     /// should be excluded from the lens, though they will still be traversed.
     /// See `walk_tree` for more details.
     ///
@@ -144,7 +144,7 @@ struct CommentProperties {
     Debug,
     Display,
     AsRefStr,
-    AsStaticStr,
+    IntoStaticStr,
     EnumString,
     EnumMessage,
     Default,
@@ -1583,8 +1583,7 @@ impl LapceLanguage {
     }
 
     pub fn name(&self) -> &'static str {
-        strum::EnumMessage::get_message(self)
-            .unwrap_or(strum::AsStaticRef::as_static(self))
+        strum::EnumMessage::get_message(self).unwrap_or(self.into())
     }
 
     fn tree_sitter(&self) -> Option<TreeSitterProperties> {
@@ -1785,9 +1784,12 @@ fn load_grammar(
         > = match library.get(language_fn_name.as_bytes()) {
             Ok(v) => v,
             Err(e) => {
+                if let Some(e) = library.close().err() {
+                    error!("Failed to drop loaded library: {e}");
+                };
                 return Err(HighlightIssue::Error(format!(
                     "Failed to load '{language_fn_name}': '{e}'"
-                )))
+                )));
             }
         };
         language_fn()

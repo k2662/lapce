@@ -1,31 +1,37 @@
-use std::{path::Path, rc::Rc};
+use std::{path::Path, rc::Rc, sync::Arc};
 
 use floem::{
     cosmic_text::Style as FontStyle,
     event::{Event, EventListener},
     peniko::Color,
-    reactive::{create_rw_signal, RwSignal},
+    reactive::{create_rw_signal, ReadSignal, RwSignal},
     style::{AlignItems, CursorStyle, Position, Style},
-    view::View,
     views::{
-        container, container_box, dyn_stack, label, scroll, stack, svg,
-        virtual_stack, Decorators, VirtualDirection, VirtualItemSize,
+        container, dyn_stack, label, scroll, stack, svg, virtual_stack, Container,
+        Decorators, VirtualDirection, VirtualItemSize,
     },
-    EventPropagation,
+    View,
 };
 use lapce_core::selection::Selection;
-use lapce_rpc::file::{FileNodeViewData, IsRenaming, RenameState};
+use lapce_rpc::{
+    file::{FileNodeViewData, FileNodeViewKind, Naming},
+    source_control::FileDiffKind,
+};
 use lapce_xi_rope::Rope;
 
 use super::{data::FileExplorerData, node::FileNodeVirtualList};
 use crate::{
     app::clickable_icon,
     command::InternalCommand,
-    config::{color::LapceColor, icon::LapceIcons},
+    config::{color::LapceColor, icon::LapceIcons, LapceConfig},
     editor_tab::{EditorTabChild, EditorTabData},
-    panel::{kind::PanelKind, position::PanelPosition, view::panel_header},
+    panel::{
+        data::PanelSection, kind::PanelKind, position::PanelPosition,
+        view::PanelBuilder,
+    },
     plugin::PluginData,
-    text_input::text_input,
+    source_control::SourceControlData,
+    text_input::TextInputBuilder,
     window_tab::{Focus, WindowTabData},
 };
 
@@ -68,30 +74,31 @@ pub fn file_explorer_panel(
 ) -> impl View {
     let config = window_tab_data.common.config;
     let data = window_tab_data.file_explorer.clone();
-    stack((
-        stack((
-            panel_header("Open Editors".to_string(), config),
+    let source_control = window_tab_data.source_control.clone();
+    PanelBuilder::new(config, position)
+        .add_height_style(
+            "Open Editors",
+            150.0,
             container(open_editors_view(window_tab_data.clone()))
-                .style(|s| s.size_pct(100.0, 100.0)),
-        ))
-        .style(|s| s.width_pct(100.0).flex_col().height(150.0)),
-        stack((
-            panel_header("File Explorer".to_string(), config),
+                .style(|s| s.size_full()),
+            window_tab_data.panel.section_open(PanelSection::OpenEditor),
+            move |s| s.apply_if(!config.get().ui.open_editors_visible, Style::hide),
+        )
+        .add(
+            "File Explorer",
             container(
-                scroll(new_file_node_view(data))
-                    .style(|s| s.absolute().size_pct(100.0, 100.0)),
+                new_file_node_view(data, source_control).style(|s| s.absolute()),
             )
-            .style(|s| s.size_pct(100.0, 100.0).line_height(1.6)),
-        ))
-        .style(|s| s.width_pct(100.0).height_pct(100.0).flex_col()),
-    ))
-    .style(move |s| {
-        s.width_pct(100.0)
-            .apply_if(!position.is_bottom(), |s| s.flex_col())
-    })
+            .style(|s| s.size_full().line_height(1.6)),
+            window_tab_data
+                .panel
+                .section_open(PanelSection::FileExplorer),
+        )
+        .build()
 }
 
-fn initialize_rename_editor(data: &FileExplorerData, path: &Path) {
+/// Initialize the file explorer's naming (renaming, creating, etc.) editor with the given path.
+fn initialize_naming_editor_with_path(data: &FileExplorerData, path: &Path) {
     let file_name = path.file_name().unwrap_or_default().to_string_lossy();
     // Start with the part of the file or directory name before the extension
     // selected.
@@ -104,57 +111,129 @@ fn initialize_rename_editor(data: &FileExplorerData, path: &Path) {
         idx + file_name.len() - without_leading_dot.len()
     };
 
-    let doc = data.rename_editor_data.view.doc.get_untracked();
-    doc.reload(Rope::from(&file_name), true);
-    data.rename_editor_data
-        .cursor
+    initialize_naming_editor(data, &file_name, Some(selection_end));
+}
+
+fn initialize_naming_editor(
+    data: &FileExplorerData,
+    text: &str,
+    selection_end: Option<usize>,
+) {
+    let text = Rope::from(text);
+    let selection_end = selection_end.unwrap_or(text.len());
+
+    let doc = data.naming_editor_data.doc();
+    doc.reload(text, true);
+    data.naming_editor_data
+        .cursor()
         .update(|cursor| cursor.set_insert(Selection::region(0, selection_end)));
 
-    data.rename_state
-        .update(|rename_state| rename_state.set_editor_needs_reset(false));
+    data.naming
+        .update(|naming| naming.set_editor_needs_reset(false));
+}
+
+fn file_node_text_color(
+    config: ReadSignal<Arc<LapceConfig>>,
+    node: FileNodeViewData,
+    source_control: SourceControlData,
+) -> Color {
+    let diff = source_control.file_diffs.with(|file_diffs| {
+        let FileNodeViewKind::Path(path) = &node.kind else {
+            return None;
+        };
+
+        if node.is_dir {
+            file_diffs
+                .keys()
+                .find(|p| p.as_path().starts_with(path))
+                .map(|_| FileDiffKind::Modified)
+        } else {
+            file_diffs.get(path).map(|(diff, _)| diff.kind())
+        }
+    });
+
+    let color = match diff {
+        Some(FileDiffKind::Modified | FileDiffKind::Renamed) => {
+            LapceColor::SOURCE_CONTROL_MODIFIED
+        }
+        Some(FileDiffKind::Added) => LapceColor::SOURCE_CONTROL_ADDED,
+        Some(FileDiffKind::Deleted) => LapceColor::SOURCE_CONTROL_REMOVED,
+        None => LapceColor::PANEL_FOREGROUND,
+    };
+
+    config.get().color(color)
 }
 
 fn file_node_text_view(
     data: FileExplorerData,
     node: FileNodeViewData,
-    path: &Path,
+    source_control: SourceControlData,
 ) -> impl View {
+    let config = data.common.config;
     let ui_line_height = data.common.ui_line_height;
 
-    let view = if let IsRenaming::Renaming { err } = node.is_renaming {
-        let rename_editor_data = data.rename_editor_data.clone();
-        let text_input_file_explorer_data = data.clone();
-        let focus = data.common.focus;
-        let config = data.common.config;
-
-        if data
-            .rename_state
-            .with_untracked(RenameState::editor_needs_reset)
-        {
-            initialize_rename_editor(&data, path);
-        }
-
-        let text_input_view = text_input(rename_editor_data.clone(), move || {
-            focus.with_untracked(|focus| {
-                focus == &Focus::Panel(PanelKind::FileExplorer)
+    let view = match node.kind.clone() {
+        FileNodeViewKind::Path(path) => container(
+            label(move || {
+                path.file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_default()
             })
-        })
-        .on_event_stop(EventListener::FocusLost, move |_| {
-            data.finish_rename();
-            data.rename_state
-                .set(lapce_rpc::file::RenameState::NotRenaming);
-        })
-        .on_event(EventListener::KeyDown, move |event| {
-            if let Event::KeyDown(event) = event {
-                let keypress = rename_editor_data.common.keypress.get_untracked();
-                if keypress.key_down(event, &text_input_file_explorer_data) {
-                    EventPropagation::Stop
-                } else {
-                    EventPropagation::Continue
-                }
-            } else {
-                EventPropagation::Continue
+            .style(move |s| {
+                s.flex_grow(1.0).height(ui_line_height.get()).color(
+                    file_node_text_color(
+                        config,
+                        node.clone(),
+                        source_control.clone(),
+                    ),
+                )
+            }),
+        ),
+        FileNodeViewKind::Renaming { path, err } => {
+            if data.naming.with_untracked(Naming::editor_needs_reset) {
+                initialize_naming_editor_with_path(&data, &path);
             }
+
+            file_node_input_view(data, err.clone())
+        }
+        FileNodeViewKind::Naming { err } => {
+            if data.naming.with_untracked(Naming::editor_needs_reset) {
+                initialize_naming_editor(&data, "", None);
+            }
+
+            file_node_input_view(data, err.clone())
+        }
+        FileNodeViewKind::Duplicating { source, err } => {
+            if data.naming.with_untracked(Naming::editor_needs_reset) {
+                initialize_naming_editor_with_path(&data, &source);
+            }
+
+            file_node_input_view(data, err.clone())
+        }
+    };
+
+    view.style(|s| s.flex_grow(1.0).padding(0.0).margin(0.0))
+}
+
+/// Input used for naming a file/directory
+fn file_node_input_view(data: FileExplorerData, err: Option<String>) -> Container {
+    let ui_line_height = data.common.ui_line_height;
+
+    let naming_editor_data = data.naming_editor_data.clone();
+    let text_input_file_explorer_data = data.clone();
+    let focus = data.common.focus;
+    let config = data.common.config;
+
+    let is_focused = move || {
+        focus.with_untracked(|focus| focus == &Focus::Panel(PanelKind::FileExplorer))
+    };
+    let text_input_view = TextInputBuilder::new()
+        .is_focused(is_focused)
+        .key_focus(text_input_file_explorer_data)
+        .build_editor(naming_editor_data.clone())
+        .on_event_stop(EventListener::FocusLost, move |_| {
+            data.finish_naming();
+            data.naming.set(Naming::None);
         })
         .style(move |s| {
             s.width_full()
@@ -166,186 +245,188 @@ fn file_node_text_view(
                 .border_color(config.get().color(LapceColor::LAPCE_BORDER))
         });
 
-        let text_input_id = text_input_view.id();
-        text_input_id.request_focus();
+    let text_input_id = text_input_view.id();
+    text_input_id.request_focus();
 
-        if let Some(err) = err {
-            container_box(
-                stack((
-                    text_input_view,
-                    label(move || err.clone()).style(move |s| {
-                        let config = config.get();
+    if let Some(err) = err {
+        container(
+            stack((
+                text_input_view,
+                label(move || err.clone()).style(move |s| {
+                    let config = config.get();
 
-                        let editor_background_color =
-                            config.color(LapceColor::PANEL_CURRENT_BACKGROUND);
-                        let error_background_color =
-                            config.color(LapceColor::ERROR_LENS_ERROR_BACKGROUND);
+                    let editor_background_color =
+                        config.color(LapceColor::PANEL_CURRENT_BACKGROUND);
+                    let error_background_color =
+                        config.color(LapceColor::ERROR_LENS_ERROR_BACKGROUND);
 
-                        let background_color = blend_colors(
-                            editor_background_color,
-                            error_background_color,
-                        );
+                    let background_color = blend_colors(
+                        editor_background_color,
+                        error_background_color,
+                    );
 
-                        s.position(Position::Absolute)
-                            .inset_top(ui_line_height.get())
-                            .width_full()
-                            .color(
-                                config
-                                    .color(LapceColor::ERROR_LENS_ERROR_FOREGROUND),
-                            )
-                            .background(background_color)
-                            .z_index(100)
-                    }),
-                ))
-                .style(|s| s.flex_grow(1.0)),
-            )
-        } else {
-            container_box(text_input_view)
-        }
-    } else {
-        container_box(
-            label(move || {
-                node.path
-                    .file_name()
-                    .map(|f| f.to_string_lossy().to_string())
-                    .unwrap_or_default()
-            })
-            .style(move |s| s.flex_grow(1.0).height(ui_line_height.get())),
+                    s.position(Position::Absolute)
+                        .inset_top(ui_line_height.get())
+                        .width_full()
+                        .color(config.color(LapceColor::ERROR_LENS_ERROR_FOREGROUND))
+                        .background(background_color)
+                        .z_index(100)
+                }),
+            ))
+            .style(|s| s.flex_grow(1.0)),
         )
-    };
-
-    view.style(|s| s.flex_grow(1.0).padding(0.0).margin(0.0))
+    } else {
+        container(text_input_view)
+    }
 }
 
-fn new_file_node_view(data: FileExplorerData) -> impl View {
+fn new_file_node_view(
+    data: FileExplorerData,
+    source_control: SourceControlData,
+) -> impl View {
     let root = data.root;
     let ui_line_height = data.common.ui_line_height;
     let config = data.common.config;
-    virtual_stack(
-        VirtualDirection::Vertical,
-        VirtualItemSize::Fixed(Box::new(move || ui_line_height.get())),
-        move || FileNodeVirtualList::new(root.get(), data.rename_state.get()),
-        move |node| {
-            (
-                node.path.clone(),
-                node.is_dir,
-                node.open,
-                node.is_renaming.clone(),
-                node.level,
-            )
-        },
-        move |node| {
-            let level = node.level;
-            let data = data.clone();
-            let click_data = data.clone();
-            let double_click_data = data.clone();
-            let secondary_click_data = data.clone();
-            let aux_click_data = data.clone();
-            let path = node.path.clone();
-            let click_path = node.path.clone();
-            let double_click_path = node.path.clone();
-            let secondary_click_path = node.path.clone();
-            let aux_click_path = path.clone();
-            let open = node.open;
-            let is_dir = node.is_dir;
-            let is_renaming = node.is_renaming.clone();
+    let naming = data.naming;
 
-            let view = stack((
-                svg(move || {
-                    let config = config.get();
-                    let svg_str = match open {
-                        true => LapceIcons::ITEM_OPENED,
-                        false => LapceIcons::ITEM_CLOSED,
-                    };
-                    config.ui_svg(svg_str)
-                })
-                .style(move |s| {
-                    let config = config.get();
-                    let size = config.ui.icon_size() as f32;
+    let secondary_click_data = data.clone();
 
-                    let color = if is_dir {
-                        config.color(LapceColor::LAPCE_ICON_ACTIVE)
-                    } else {
-                        Color::TRANSPARENT
-                    };
-                    s.size(size, size)
-                        .flex_shrink(0.0)
-                        .margin_left(10.0)
-                        .color(color)
-                }),
-                {
-                    let path = path.clone();
-                    let path_for_style = path.clone();
+    scroll(
+        virtual_stack(
+            VirtualDirection::Vertical,
+            VirtualItemSize::Fixed(Box::new(move || ui_line_height.get())),
+            move || FileNodeVirtualList::new(root.get(), data.naming.get()),
+            move |node| (node.kind.clone(), node.is_dir, node.open, node.level),
+            move |node| {
+                let level = node.level;
+                let data = data.clone();
+                let click_data = data.clone();
+                let double_click_data = data.clone();
+                let secondary_click_data = data.clone();
+                let aux_click_data = data.clone();
+                let kind = node.kind.clone();
+                let open = node.open;
+                let is_dir = node.is_dir;
+
+                let view = stack((
                     svg(move || {
                         let config = config.get();
-                        if is_dir {
-                            let svg_str = match open {
-                                true => LapceIcons::DIRECTORY_OPENED,
-                                false => LapceIcons::DIRECTORY_CLOSED,
-                            };
-                            config.ui_svg(svg_str)
-                        } else {
-                            config.file_svg(&path).0
-                        }
+                        let svg_str = match open {
+                            true => LapceIcons::ITEM_OPENED,
+                            false => LapceIcons::ITEM_CLOSED,
+                        };
+                        config.ui_svg(svg_str)
                     })
                     .style(move |s| {
                         let config = config.get();
                         let size = config.ui.icon_size() as f32;
 
+                        let color = if is_dir {
+                            config.color(LapceColor::LAPCE_ICON_ACTIVE)
+                        } else {
+                            Color::TRANSPARENT
+                        };
                         s.size(size, size)
                             .flex_shrink(0.0)
-                            .margin_horiz(6.0)
-                            .apply_if(is_dir, |s| {
-                                s.color(config.color(LapceColor::LAPCE_ICON_ACTIVE))
-                            })
-                            .apply_if(!is_dir, |s| {
-                                s.apply_opt(
-                                    config.file_svg(&path_for_style).1,
-                                    Style::color,
-                                )
-                            })
-                    })
-                },
-                file_node_text_view(data, node, &path),
-            ))
-            .style(move |s| {
-                s.padding_right(5.0)
-                    .padding_left((level * 10) as f32)
-                    .align_items(AlignItems::Center)
-                    .hover(|s| {
-                        s.background(
-                            config.get().color(LapceColor::PANEL_HOVERED_BACKGROUND),
-                        )
-                        .cursor(CursorStyle::Pointer)
-                    })
-            });
-
-            if let IsRenaming::NotRenaming = is_renaming {
-                view.on_click_stop(move |_| {
-                    click_data.click(&click_path);
-                })
-                .on_double_click(move |_| {
-                    double_click_data.double_click(&double_click_path)
-                })
-                .on_secondary_click_stop(move |_| {
-                    secondary_click_data.secondary_click(&secondary_click_path);
-                })
-                .on_event_stop(
-                    EventListener::PointerDown,
-                    move |event| {
-                        if let Event::PointerDown(pointer_event) = event {
-                            if pointer_event.button.is_auxiliary() {
-                                aux_click_data.middle_click(&aux_click_path);
+                            .margin_left(10.0)
+                            .color(color)
+                    }),
+                    {
+                        let kind = kind.clone();
+                        let kind_for_style = kind.clone();
+                        // TODO: use the current naming input as the path for the file svg
+                        svg(move || {
+                            let config = config.get();
+                            if is_dir {
+                                let svg_str = match open {
+                                    true => LapceIcons::DIRECTORY_OPENED,
+                                    false => LapceIcons::DIRECTORY_CLOSED,
+                                };
+                                config.ui_svg(svg_str)
+                            } else if let Some(path) = kind.path() {
+                                config.file_svg(path).0
+                            } else {
+                                config.ui_svg(LapceIcons::FILE)
                             }
-                        }
+                        })
+                        .style(move |s| {
+                            let config = config.get();
+                            let size = config.ui.icon_size() as f32;
+
+                            s.size(size, size)
+                                .flex_shrink(0.0)
+                                .margin_horiz(6.0)
+                                .apply_if(is_dir, |s| {
+                                    s.color(
+                                        config.color(LapceColor::LAPCE_ICON_ACTIVE),
+                                    )
+                                })
+                                .apply_if(!is_dir, |s| {
+                                    s.apply_opt(
+                                        kind_for_style
+                                            .path()
+                                            .and_then(|p| config.file_svg(p).1),
+                                        Style::color,
+                                    )
+                                })
+                        })
                     },
-                )
-            } else {
-                view
-            }
-        },
+                    file_node_text_view(data, node, source_control.clone()),
+                ))
+                .style(move |s| {
+                    s.padding_right(5.0)
+                        .padding_left((level * 10) as f32)
+                        .align_items(AlignItems::Center)
+                        .hover(|s| {
+                            s.background(
+                                config
+                                    .get()
+                                    .color(LapceColor::PANEL_HOVERED_BACKGROUND),
+                            )
+                            .cursor(CursorStyle::Pointer)
+                        })
+                });
+
+                // Only handle click events if we are not naming the file node
+                if let FileNodeViewKind::Path(path) = kind {
+                    let click_path = path.clone();
+                    let double_click_path = path.clone();
+                    let secondary_click_path = path.clone();
+                    let aux_click_path = path;
+                    view.on_click_stop(move |_| {
+                        click_data.click(&click_path);
+                    })
+                    .on_double_click(move |_| {
+                        double_click_data.double_click(&double_click_path)
+                    })
+                    .on_secondary_click_stop(move |_| {
+                        secondary_click_data.secondary_click(&secondary_click_path);
+                    })
+                    .on_event_stop(
+                        EventListener::PointerDown,
+                        move |event| {
+                            if let Event::PointerDown(pointer_event) = event {
+                                if pointer_event.button.is_auxiliary() {
+                                    aux_click_data.middle_click(&aux_click_path);
+                                }
+                            }
+                        },
+                    )
+                } else {
+                    view
+                }
+            },
+        )
+        .style(|s| s.flex_col().align_items(AlignItems::Stretch).width_full()),
     )
-    .style(|s| s.flex_col().align_items(AlignItems::Stretch).width_full())
+    .style(|s| s.size_full())
+    .on_secondary_click_stop(move |_| {
+        if let Naming::None = naming.get_untracked() {
+            if let Some(path) = &secondary_click_data.common.workspace.path {
+                secondary_click_data.secondary_click(path);
+            }
+        }
+    })
 }
 
 fn open_editors_view(window_tab_data: Rc<WindowTabData>) -> impl View {
@@ -386,6 +467,7 @@ fn open_editors_view(window_tab_data: Rc<WindowTabData>) -> impl View {
                 },
                 || false,
                 || false,
+                || "Close",
                 config,
             )
             .on_event_stop(EventListener::PointerEnter, move |_| {

@@ -8,16 +8,20 @@ use std::{path::PathBuf, rc::Rc, str::FromStr};
 
 use anyhow::Result;
 use floem::{
-    keyboard::{Key, KeyEvent, ModifiersState, NamedKey},
+    keyboard::{Key, KeyEvent, KeyEventExtModifierSupplement, Modifiers, NamedKey},
     pointer::PointerInputEvent,
     reactive::{RwSignal, Scope},
 };
 use indexmap::IndexMap;
 use itertools::Itertools;
 use lapce_core::mode::{Mode, Modes};
-use tracing::{debug, error};
 
-use self::{key::KeyInput, keymap::KeyMap, loader::KeyMapLoader};
+pub use self::press::KeyPress;
+use self::{
+    key::KeyInput,
+    keymap::{KeyMap, KeyMapPress},
+    loader::KeyMapLoader,
+};
 use crate::{
     command::{lapce_internal_commands, CommandExecuted, CommandKind, LapceCommand},
     config::LapceConfig,
@@ -26,8 +30,6 @@ use crate::{
         keymap::KeymapMatch,
     },
 };
-
-pub use self::press::KeyPress;
 
 const DEFAULT_KEYMAPS_COMMON: &str =
     include_str!("../../defaults/keymaps-common.toml");
@@ -45,7 +47,7 @@ pub trait KeyPressFocus {
         &self,
         command: &LapceCommand,
         count: Option<usize>,
-        mods: ModifiersState,
+        mods: Modifiers,
     ) -> CommandExecuted;
 
     fn expect_char(&self) -> bool {
@@ -57,6 +59,64 @@ pub trait KeyPressFocus {
     }
 
     fn receive_char(&self, c: &str);
+}
+impl KeyPressFocus for () {
+    fn get_mode(&self) -> Mode {
+        Mode::Normal
+    }
+
+    fn check_condition(&self, _condition: Condition) -> bool {
+        false
+    }
+
+    fn run_command(
+        &self,
+        _command: &LapceCommand,
+        _count: Option<usize>,
+        _mods: Modifiers,
+    ) -> CommandExecuted {
+        CommandExecuted::No
+    }
+
+    fn expect_char(&self) -> bool {
+        false
+    }
+
+    fn focus_only(&self) -> bool {
+        false
+    }
+
+    fn receive_char(&self, _c: &str) {}
+}
+impl KeyPressFocus for Box<dyn KeyPressFocus> {
+    fn get_mode(&self) -> Mode {
+        (**self).get_mode()
+    }
+
+    fn check_condition(&self, condition: Condition) -> bool {
+        (**self).check_condition(condition)
+    }
+
+    fn run_command(
+        &self,
+        command: &LapceCommand,
+        count: Option<usize>,
+        mods: Modifiers,
+    ) -> CommandExecuted {
+        (**self).run_command(command, count, mods)
+    }
+
+    fn expect_char(&self) -> bool {
+        (**self).expect_char()
+    }
+
+    fn focus_only(&self) -> bool {
+        (**self).focus_only()
+    }
+
+    fn receive_char(&self, c: &str) {
+        (**self).receive_char(c)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -82,7 +142,7 @@ pub struct KeyPressData {
     count: RwSignal<Option<usize>>,
     pending_keypress: RwSignal<Vec<KeyPress>>,
     pub commands: Rc<IndexMap<String, LapceCommand>>,
-    pub keymaps: Rc<IndexMap<Vec<KeyPress>, Vec<KeyMap>>>,
+    pub keymaps: Rc<IndexMap<Vec<KeyMapPress>, Vec<KeyMap>>>,
     pub command_keymaps: Rc<IndexMap<String, Vec<KeyMap>>>,
     pub commands_with_keymap: Rc<Vec<KeyMap>>,
     pub commands_without_keymap: Rc<Vec<LapceCommand>>,
@@ -134,7 +194,7 @@ impl KeyPressData {
         self.commands_without_keymap = Rc::new(commands_without_keymap);
     }
 
-    fn handle_count<T: KeyPressFocus>(
+    fn handle_count<T: KeyPressFocus + ?Sized>(
         &self,
         focus: &T,
         keypress: &KeyPress,
@@ -151,7 +211,11 @@ impl KeyPressData {
             return false;
         }
 
-        if let KeyInput::Keyboard(Key::Character(c), _key_code) = &keypress.key {
+        if let KeyInput::Keyboard {
+            logical: Key::Character(c),
+            ..
+        } = &keypress.key
+        {
             if let Ok(n) = c.parse::<usize>() {
                 if self.count.with_untracked(|count| count.is_some()) || n > 0 {
                     self.count
@@ -164,11 +228,11 @@ impl KeyPressData {
         false
     }
 
-    fn run_command<T: KeyPressFocus>(
+    fn run_command<T: KeyPressFocus + ?Sized>(
         &self,
         command: &str,
         count: Option<usize>,
-        mods: ModifiersState,
+        mods: Modifiers,
         focus: &T,
     ) -> CommandExecuted {
         if let Some(cmd) = self.commands.get(command) {
@@ -180,14 +244,15 @@ impl KeyPressData {
 
     pub fn keypress<'a>(event: impl Into<EventRef<'a>>) -> Option<KeyPress> {
         let event = event.into();
-        debug!("{event:?}");
+        tracing::trace!("{event:?}");
 
         let keypress = match event {
             EventRef::Keyboard(ev) => KeyPress {
-                key: KeyInput::Keyboard(
-                    ev.key.logical_key.clone(),
-                    ev.key.physical_key,
-                ),
+                key: KeyInput::Keyboard {
+                    logical: ev.key.logical_key.to_owned(),
+                    physical: ev.key.physical_key,
+                    key_without_modifiers: ev.key.key_without_modifiers(),
+                },
                 mods: Self::get_key_modifiers(ev),
             },
             EventRef::Pointer(ev) => KeyPress {
@@ -198,7 +263,7 @@ impl KeyPressData {
         Some(keypress)
     }
 
-    pub fn key_down<'a, T: KeyPressFocus>(
+    pub fn key_down<'a, T: KeyPressFocus + ?Sized>(
         &self,
         event: impl Into<EventRef<'a>>,
         focus: &T,
@@ -255,7 +320,7 @@ impl KeyPressData {
                 });
                 if focus.get_mode() == Mode::Insert {
                     let mut keypress = keypress.clone();
-                    keypress.mods.set(ModifiersState::SHIFT, false);
+                    keypress.mods.set(Modifiers::SHIFT, false);
                     if let KeymapMatch::Full(command) =
                         self.match_keymap(&[keypress], focus)
                     {
@@ -274,53 +339,53 @@ impl KeyPressData {
 
         #[cfg(target_os = "macos")]
         {
-            mods.set(ModifiersState::SHIFT, false);
-            mods.set(ModifiersState::ALT, false);
+            mods.set(Modifiers::SHIFT, false);
+            mods.set(Modifiers::ALT, false);
         }
         #[cfg(not(target_os = "macos"))]
         {
-            mods.set(ModifiersState::SHIFT, false);
+            mods.set(Modifiers::SHIFT, false);
+            mods.set(Modifiers::ALTGR, false);
         }
         if mods.is_empty() {
-            if let KeyInput::Keyboard(Key::Character(c), _key_code) = &keypress.key {
-                focus.receive_char(c);
-                self.count.set(None);
-                return true;
-            } else if let KeyInput::Keyboard(Key::Named(NamedKey::Space), _) =
-                &keypress.key
-            {
-                focus.receive_char(" ");
-                self.count.set(None);
-                return true;
+            if let KeyInput::Keyboard { logical, .. } = &keypress.key {
+                if let Key::Character(c) = logical {
+                    focus.receive_char(c);
+                    self.count.set(None);
+                    return true;
+                } else if let Key::Named(NamedKey::Space) = logical {
+                    focus.receive_char(" ");
+                    self.count.set(None);
+                    return true;
+                }
             }
         }
 
         false
     }
 
-    fn get_key_modifiers(key_event: &KeyEvent) -> ModifiersState {
+    fn get_key_modifiers(key_event: &KeyEvent) -> Modifiers {
         let mut mods = key_event.modifiers;
 
         match &key_event.key.logical_key {
-            Key::Named(NamedKey::Shift) => mods.set(ModifiersState::SHIFT, false),
-            Key::Named(NamedKey::Alt) => mods.set(ModifiersState::ALT, false),
-            Key::Named(NamedKey::Meta) => mods.set(ModifiersState::SUPER, false),
-            Key::Named(NamedKey::Control) => {
-                mods.set(ModifiersState::CONTROL, false)
-            }
+            Key::Named(NamedKey::Shift) => mods.set(Modifiers::SHIFT, false),
+            Key::Named(NamedKey::Alt) => mods.set(Modifiers::ALT, false),
+            Key::Named(NamedKey::Meta) => mods.set(Modifiers::META, false),
+            Key::Named(NamedKey::Control) => mods.set(Modifiers::CONTROL, false),
+            Key::Named(NamedKey::AltGraph) => mods.set(Modifiers::ALTGR, false),
             _ => (),
         }
 
         mods
     }
 
-    fn match_keymap<T: KeyPressFocus>(
+    fn match_keymap<T: KeyPressFocus + ?Sized>(
         &self,
         keypresses: &[KeyPress],
         check: &T,
     ) -> KeymapMatch {
-        let keypresses: Vec<KeyPress> =
-            keypresses.iter().map(KeyPress::to_lowercase).collect();
+        let keypresses: Vec<KeyMapPress> =
+            keypresses.iter().map(|k| k.keymap_press()).collect();
         let matches: Vec<_> = self
             .keymaps
             .get(&keypresses)
@@ -365,8 +430,11 @@ impl KeyPressData {
         }
     }
 
-    fn check_condition<T: KeyPressFocus>(condition: &str, check: &T) -> bool {
-        fn check_one_condition<T: KeyPressFocus>(
+    fn check_condition<T: KeyPressFocus + ?Sized>(
+        condition: &str,
+        check: &T,
+    ) -> bool {
+        fn check_one_condition<T: KeyPressFocus + ?Sized>(
             condition: &str,
             check: &T,
         ) -> bool {
@@ -407,7 +475,7 @@ impl KeyPressData {
     fn get_keymaps(
         config: &LapceConfig,
     ) -> Result<(
-        IndexMap<Vec<KeyPress>, Vec<KeyMap>>,
+        IndexMap<Vec<KeyMapPress>, Vec<KeyMap>>,
         IndexMap<String, Vec<KeyMap>>,
     )> {
         let is_modal = config.core.modal;
@@ -415,7 +483,7 @@ impl KeyPressData {
         let mut loader = KeyMapLoader::new();
 
         if let Err(err) = loader.load_from_str(DEFAULT_KEYMAPS_COMMON, is_modal) {
-            error!("Failed to load common defaults: {err}");
+            tracing::error!("Failed to load common defaults: {err}");
         }
 
         let os_keymaps = if std::env::consts::OS == "macos" {
@@ -425,13 +493,13 @@ impl KeyPressData {
         };
 
         if let Err(err) = loader.load_from_str(os_keymaps, is_modal) {
-            error!("Failed to load OS defaults: {err}");
+            tracing::error!("Failed to load OS defaults: {err}");
         }
 
         if let Some(path) = Self::file() {
             if let Ok(content) = std::fs::read_to_string(&path) {
                 if let Err(err) = loader.load_from_str(&content, is_modal) {
-                    error!("Failed to load from {path:?}: {err}");
+                    tracing::warn!("Failed to load from {path:?}: {err}");
                 }
             }
         }
@@ -454,7 +522,7 @@ impl KeyPressData {
             .cloned()
     }
 
-    pub fn update_file(keymap: &KeyMap, keys: &[KeyPress]) -> Option<()> {
+    pub fn update_file(keymap: &KeyMap, keys: &[KeyMapPress]) -> Option<()> {
         let mut array = Self::get_file_array().unwrap_or_default();
         let index = array.iter().position(|value| {
             Some(keymap.command.as_str())
@@ -466,16 +534,14 @@ impl KeyPressData {
                     == value
                         .get("key")
                         .and_then(|v| v.as_str())
-                        .map(KeyPress::parse)
+                        .map(KeyMapPress::parse)
         });
 
         if let Some(index) = index {
             if !keys.is_empty() {
                 array.get_mut(index)?.insert(
                     "key",
-                    toml_edit::value(toml_edit::Value::from(
-                        keys.iter().map(|k| k.to_string()).join(" "),
-                    )),
+                    toml_edit::value(toml_edit::Value::from(keys.iter().join(" "))),
                 );
             } else {
                 array.remove(index);
@@ -504,9 +570,7 @@ impl KeyPressData {
             if !keys.is_empty() {
                 table.insert(
                     "key",
-                    toml_edit::value(toml_edit::Value::from(
-                        keys.iter().map(|k| k.to_string()).join(" "),
-                    )),
+                    toml_edit::value(toml_edit::Value::from(keys.iter().join(" "))),
                 );
                 array.push(table.clone());
             }
@@ -515,7 +579,7 @@ impl KeyPressData {
                 table.insert(
                     "key",
                     toml_edit::value(toml_edit::Value::from(
-                        keymap.key.iter().map(|k| k.to_string()).join(" "),
+                        keymap.key.iter().join(" "),
                     )),
                 );
                 table.insert(

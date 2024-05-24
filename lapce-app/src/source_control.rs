@@ -1,7 +1,7 @@
 use std::{path::PathBuf, rc::Rc};
 
 use floem::{
-    keyboard::ModifiersState,
+    keyboard::Modifiers,
     reactive::{RwSignal, Scope},
 };
 use indexmap::IndexMap;
@@ -11,8 +11,8 @@ use lapce_rpc::source_control::FileDiff;
 use crate::{
     command::{CommandExecuted, CommandKind},
     editor::EditorData,
-    id::EditorId,
     keypress::{condition::Condition, KeyPressFocus},
+    main_split::Editors,
     window_tab::CommonData,
 };
 
@@ -23,7 +23,7 @@ pub struct SourceControlData {
     pub branch: RwSignal<String>,
     pub branches: RwSignal<im::Vector<String>>,
     pub tags: RwSignal<im::Vector<String>>,
-    pub editor: Rc<EditorData>,
+    pub editor: EditorData,
     pub common: Rc<CommonData>,
 }
 
@@ -43,7 +43,7 @@ impl KeyPressFocus for SourceControlData {
         &self,
         command: &crate::command::LapceCommand,
         count: Option<usize>,
-        mods: ModifiersState,
+        mods: Modifiers,
     ) -> CommandExecuted {
         match &command.kind {
             CommandKind::Edit(_)
@@ -61,17 +61,13 @@ impl KeyPressFocus for SourceControlData {
 }
 
 impl SourceControlData {
-    pub fn new(cx: Scope, common: Rc<CommonData>) -> Self {
+    pub fn new(cx: Scope, editors: Editors, common: Rc<CommonData>) -> Self {
         Self {
             file_diffs: cx.create_rw_signal(IndexMap::new()),
             branch: cx.create_rw_signal("".to_string()),
             branches: cx.create_rw_signal(im::Vector::new()),
             tags: cx.create_rw_signal(im::Vector::new()),
-            editor: Rc::new(EditorData::new_local(
-                cx,
-                EditorId::next(),
-                common.clone(),
-            )),
+            editor: editors.make_local(cx, common.clone()),
             common,
         }
     }
@@ -98,9 +94,7 @@ impl SourceControlData {
 
         let message = self
             .editor
-            .view
-            .doc
-            .get_untracked()
+            .doc()
             .buffer
             .with_untracked(|buffer| buffer.to_string());
         let message = message.trim();

@@ -1,27 +1,46 @@
 use std::{
-    cmp::Ordering, collections::HashMap, rc::Rc, str::FromStr, sync::Arc,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+    str::FromStr,
+    sync::Arc,
     time::Duration,
 };
 
-use anyhow::Result;
 use floem::{
     action::{exec_after, show_context_menu, TimerToken},
     ext_event::create_ext_action,
-    keyboard::ModifiersState,
+    keyboard::Modifiers,
+    kurbo::{Point, Rect, Vec2},
     menu::{Menu, MenuItem},
-    peniko::kurbo::{Point, Rect, Vec2},
     pointer::{PointerButton, PointerInputEvent, PointerMoveEvent},
     reactive::{batch, use_context, ReadSignal, RwSignal, Scope},
+    views::editor::{
+        command::CommandExecuted,
+        id::EditorId,
+        movement,
+        text::Document,
+        view::{
+            DiffSection, DiffSectionKind, LineInfo, ScreenLines, ScreenLinesBase,
+        },
+        visual_line::{ConfigId, Lines, TextLayoutProvider, VLine, VLineInfo},
+        Editor,
+    },
 };
 use lapce_core::{
-    buffer::{diff::DiffLines, rope_text::RopeText, InvalLines},
-    command::{EditCommand, FocusCommand, MotionModeCommand, MultiSelectionCommand},
+    buffer::{
+        diff::DiffLines,
+        rope_text::{RopeText, RopeTextVal},
+        InvalLines,
+    },
+    command::{
+        EditCommand, FocusCommand, MotionModeCommand, MultiSelectionCommand,
+        ScrollCommand,
+    },
     cursor::{Cursor, CursorMode},
     editor::EditType,
     mode::{Mode, MotionMode},
-    movement::Movement,
-    selection::{InsertDrift, Selection},
-    syntax::edit::SyntaxEdit,
+    rope_text_pos::RopeTextPosition,
+    selection::{InsertDrift, SelRegion, Selection},
 };
 use lapce_rpc::{buffer::BufferId, plugin::PluginId, proxy::ProxyResponse};
 use lapce_xi_rope::{Rope, RopeDelta, Transformer};
@@ -32,23 +51,16 @@ use lsp_types::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    command::{
-        CommandExecuted, CommandKind, InternalCommand, LapceCommand,
-        LapceWorkbenchCommand,
-    },
+    command::{CommandKind, InternalCommand, LapceCommand, LapceWorkbenchCommand},
     completion::CompletionStatus,
     config::LapceConfig,
     db::LapceDb,
-    doc::{DocContent, Document, DocumentExt},
-    editor::{
-        location::{EditorLocation, EditorPosition},
-        visual_line::Lines,
-    },
+    doc::{Doc, DocContent},
     editor_tab::EditorTabChild,
-    id::{DiffEditorId, EditorId, EditorTabId},
+    id::{DiffEditorId, EditorTabId},
     inline_completion::{InlineCompletionItem, InlineCompletionStatus},
     keypress::{condition::Condition, KeyPressFocus},
-    main_split::{MainSplitData, SplitDirection, SplitMoveDirection},
+    main_split::{Editors, MainSplitData, SplitDirection, SplitMoveDirection},
     markdown::{
         from_marked_string, from_plaintext, parse_markdown, MarkdownContent,
     },
@@ -58,20 +70,14 @@ use crate::{
 };
 
 use self::{
-    view::{DiffSection, DiffSectionKind, LineInfo, ScreenLines, ScreenLinesBase},
-    view_data::{EditorViewData, EditorViewKind},
-    visual_line::{TextLayoutProvider, VLine, VLineInfo},
+    diff::DiffInfo,
+    location::{EditorLocation, EditorPosition},
 };
 
 pub mod diff;
 pub mod gutter;
 pub mod location;
-pub mod movement;
 pub mod view;
-pub mod view_data;
-pub mod visual_line;
-
-const CHAR_WIDTH: f64 = 7.5;
 
 #[derive(Clone, Debug)]
 pub enum InlineFindDirection {
@@ -82,7 +88,7 @@ pub enum InlineFindDirection {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct EditorInfo {
     pub content: DocContent,
-    // pub unsaved: Option<String>,
+    pub unsaved: Option<String>,
     pub offset: usize,
     pub scroll_offset: (f64, f64),
 }
@@ -92,21 +98,22 @@ impl EditorInfo {
         &self,
         data: MainSplitData,
         editor_tab_id: EditorTabId,
-    ) -> Rc<EditorData> {
-        let editor_id = EditorId::next();
-        let editor_data = match &self.content {
+    ) -> EditorId {
+        let editors = &data.editors;
+        let common = data.common.clone();
+        match &self.content {
             DocContent::File { path, .. } => {
-                let (doc, new_doc) = data.get_doc(path.clone());
-                let editor_data = EditorData::new(
+                let (doc, new_doc) =
+                    data.get_doc(path.clone(), self.unsaved.clone());
+                let editor = editors.make_from_doc(
                     data.scope,
+                    doc,
                     Some(editor_tab_id),
                     None,
-                    editor_id,
-                    doc,
                     None,
-                    data.common,
+                    common,
                 );
-                editor_data.go_to_location(
+                editor.go_to_location(
                     EditorLocation {
                         path: path.clone(),
                         position: Some(EditorPosition::Offset(self.offset)),
@@ -120,14 +127,11 @@ impl EditorInfo {
                     new_doc,
                     None,
                 );
-                editor_data
+
+                editor.id()
             }
-            DocContent::Local => {
-                EditorData::new_local(data.scope, editor_id, data.common)
-            }
-            DocContent::History(_) => {
-                EditorData::new_local(data.scope, editor_id, data.common)
-            }
+            DocContent::Local => editors.new_local(data.scope, common),
+            DocContent::History(_) => editors.new_local(data.scope, common),
             DocContent::Scratch { name, .. } => {
                 let doc = data
                     .scratch_docs
@@ -139,225 +143,268 @@ impl EditorInfo {
                             id: BufferId::next(),
                             name: name.to_string(),
                         };
-                        let doc = Document::new_content(
+                        let doc = Doc::new_content(
                             data.scope,
                             content,
+                            data.editors,
                             data.common.clone(),
                         );
                         let doc = Rc::new(doc);
+                        if let Some(unsaved) = &self.unsaved {
+                            doc.reload(Rope::from(unsaved), false);
+                        }
                         scratch_docs.insert(name.to_string(), doc.clone());
                         doc
                     })
                     .unwrap();
 
-                EditorData::new(
+                editors.new_from_doc(
                     data.scope,
+                    doc,
                     Some(editor_tab_id),
                     None,
-                    editor_id,
-                    doc,
                     None,
-                    data.common,
+                    common,
                 )
             }
-        };
-        let editor_data = Rc::new(editor_data);
-        data.editors.update(|editors| {
-            editors.insert(editor_id, editor_data.clone());
-        });
-        editor_data
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum EditorViewKind {
+    Normal,
+    Diff(DiffInfo),
+}
+
+impl EditorViewKind {
+    pub fn is_normal(&self) -> bool {
+        matches!(self, EditorViewKind::Normal)
     }
 }
 
 pub type SnippetIndex = Vec<(usize, (usize, usize))>;
 
+/// Shares data between cloned instances as long as the signals aren't swapped out.
 #[derive(Clone)]
 pub struct EditorData {
     pub scope: Scope,
-    pub editor_id: EditorId,
     pub editor_tab_id: RwSignal<Option<EditorTabId>>,
     pub diff_editor_id: RwSignal<Option<(EditorTabId, DiffEditorId)>>,
-    pub view: EditorViewData,
     pub confirmed: RwSignal<bool>,
-    pub cursor: RwSignal<Cursor>,
-    pub window_origin: RwSignal<Point>,
-    pub viewport: RwSignal<Rect>,
-    pub scroll_delta: RwSignal<Vec2>,
-    pub scroll_to: RwSignal<Option<Vec2>>,
     pub snippet: RwSignal<Option<SnippetIndex>>,
-    pub last_movement: RwSignal<Movement>,
     pub inline_find: RwSignal<Option<InlineFindDirection>>,
     pub last_inline_find: RwSignal<Option<(InlineFindDirection, String)>>,
     pub find_focus: RwSignal<bool>,
-    pub active: RwSignal<bool>,
+    pub editor: Rc<Editor>,
+    pub kind: RwSignal<EditorViewKind>,
     pub sticky_header_height: RwSignal<f64>,
     pub common: Rc<CommonData>,
 }
 
 impl PartialEq for EditorData {
     fn eq(&self, other: &Self) -> bool {
-        self.editor_id == other.editor_id
+        self.id() == other.id()
     }
 }
 
 impl EditorData {
-    pub fn new(
+    fn new(
         cx: Scope,
+        editor: Editor,
         editor_tab_id: Option<EditorTabId>,
         diff_editor_id: Option<(EditorTabId, DiffEditorId)>,
-        editor_id: EditorId,
-        doc: Rc<Document>,
         confirmed: Option<RwSignal<bool>>,
         common: Rc<CommonData>,
     ) -> Self {
         let cx = cx.create_child();
 
-        let is_local = doc.content.with_untracked(|content| content.is_local());
-        let viewport = cx.create_rw_signal(Rect::ZERO);
-        let modal = common.config.with_untracked(|c| c.core.modal);
-        let cursor = Cursor::new(
-            if modal && !is_local {
-                CursorMode::Normal(0)
-            } else {
-                CursorMode::Insert(Selection::caret(0))
-            },
-            None,
-            None,
-        );
-        let cursor = cx.create_rw_signal(cursor);
-        let view = EditorViewData::new(
-            cx,
-            doc,
-            EditorViewKind::Normal,
-            viewport,
-            common.config,
-        );
-        {
-            let internal_comamnd = common.internal_command;
-            cx.create_effect(move |_| {
-                cursor.track();
-                internal_comamnd.send(InternalCommand::ResetBlinkCursor);
-            });
-        }
         let confirmed = confirmed.unwrap_or_else(|| cx.create_rw_signal(false));
-        Self {
+        EditorData {
             scope: cx,
             editor_tab_id: cx.create_rw_signal(editor_tab_id),
             diff_editor_id: cx.create_rw_signal(diff_editor_id),
-            editor_id,
-            view,
-            cursor,
             confirmed,
             snippet: cx.create_rw_signal(None),
-            window_origin: cx.create_rw_signal(Point::ZERO),
-            viewport,
-            scroll_delta: cx.create_rw_signal(Vec2::ZERO),
-            scroll_to: cx.create_rw_signal(None),
-            last_movement: cx.create_rw_signal(Movement::Left),
             inline_find: cx.create_rw_signal(None),
             last_inline_find: cx.create_rw_signal(None),
             find_focus: cx.create_rw_signal(false),
-            active: cx.create_rw_signal(false),
+            editor: Rc::new(editor),
+            kind: cx.create_rw_signal(EditorViewKind::Normal),
             sticky_header_height: cx.create_rw_signal(0.0),
             common,
         }
     }
 
-    pub fn new_local(
+    /// Create a new local editor.  
+    /// You should prefer calling [`Editors::make_local`] / [`Editors::new_local`] instead to
+    /// register the editor.
+    pub fn new_local(cx: Scope, editors: Editors, common: Rc<CommonData>) -> Self {
+        Self::new_local_id(cx, EditorId::next(), editors, common)
+    }
+
+    /// Create a new local editor with the given id.  
+    /// You should prefer calling [`Editors::make_local`] / [`Editors::new_local`] instead to
+    /// register the editor.
+    pub fn new_local_id(
         cx: Scope,
         editor_id: EditorId,
+        editors: Editors,
         common: Rc<CommonData>,
     ) -> Self {
         let cx = cx.create_child();
-        let doc = Rc::new(Document::new_local(cx, common.clone()));
-        Self::new(cx, None, None, editor_id, doc, None, common)
+        let doc = Rc::new(Doc::new_local(cx, editors, common.clone()));
+        let editor = doc.create_editor(cx, editor_id, true);
+        Self::new(cx, editor, None, None, None, common)
     }
 
-    pub fn editor_info(&self, _data: &WindowTabData) -> EditorInfo {
-        let offset = self.cursor.get_untracked().offset();
-        let scroll_offset = self.viewport.get_untracked().origin();
-        EditorInfo {
-            content: self.view.doc.get_untracked().content.get_untracked(),
-            offset,
-            scroll_offset: (scroll_offset.x, scroll_offset.y),
-        }
+    /// Create a new editor with a specific doc.  
+    /// You should prefer calling [`Editors::new_editor_doc`] / [`Editors::make_from_doc`] instead.
+    pub fn new_doc(
+        cx: Scope,
+        doc: Rc<Doc>,
+        editor_tab_id: Option<EditorTabId>,
+        diff_editor_id: Option<(EditorTabId, DiffEditorId)>,
+        confirmed: Option<RwSignal<bool>>,
+        common: Rc<CommonData>,
+    ) -> Self {
+        let editor = doc.create_editor(cx, EditorId::next(), false);
+        Self::new(cx, editor, editor_tab_id, diff_editor_id, confirmed, common)
     }
 
-    /// Swap out the document this editor is for.
-    pub fn update_doc(&self, doc: Rc<Document>) {
-        self.view.update_doc(doc);
+    /// Swap out the document this editor is for
+    pub fn update_doc(&self, doc: Rc<Doc>) {
+        let style = doc.styling();
+        self.editor.update_doc(doc, Some(style));
     }
 
+    /// Create a new editor using the same underlying [`Doc`]  
     pub fn copy(
         &self,
         cx: Scope,
         editor_tab_id: Option<EditorTabId>,
         diff_editor_id: Option<(EditorTabId, DiffEditorId)>,
-        editor_id: EditorId,
         confirmed: Option<RwSignal<bool>>,
     ) -> Self {
         let cx = cx.create_child();
-        let cursor = cx.create_rw_signal(self.cursor.get_untracked());
-        {
-            let internal_comamnd = self.common.internal_command;
-            cx.create_effect(move |_| {
-                cursor.track();
-                internal_comamnd.send(InternalCommand::ResetBlinkCursor);
-            });
-        }
-        let viewport = cx.create_rw_signal(self.viewport.get_untracked());
+
         let confirmed = confirmed.unwrap_or_else(|| cx.create_rw_signal(true));
 
-        EditorData {
-            scope: cx,
-            editor_id,
-            editor_tab_id: cx.create_rw_signal(editor_tab_id),
-            diff_editor_id: cx.create_rw_signal(diff_editor_id),
-            view: self.view.duplicate(cx, viewport),
-            cursor,
-            viewport,
-            scroll_delta: cx.create_rw_signal(Vec2::ZERO),
-            scroll_to: cx.create_rw_signal(Some(
-                self.viewport.get_untracked().origin().to_vec2(),
-            )),
-            window_origin: cx.create_rw_signal(Point::ZERO),
-            confirmed,
-            snippet: cx.create_rw_signal(None),
-            last_movement: cx.create_rw_signal(self.last_movement.get_untracked()),
-            inline_find: cx.create_rw_signal(None),
-            last_inline_find: cx.create_rw_signal(None),
-            find_focus: cx.create_rw_signal(false),
-            active: cx.create_rw_signal(false),
-            sticky_header_height: cx.create_rw_signal(0.0),
-            common: self.common.clone(),
+        let editor = Self::new_doc(
+            cx,
+            self.doc(),
+            editor_tab_id,
+            diff_editor_id,
+            Some(confirmed),
+            self.common.clone(),
+        );
+        editor.editor.cursor.set(self.editor.cursor.get_untracked());
+        editor
+            .editor
+            .viewport
+            .set(self.editor.viewport.get_untracked());
+        editor.editor.scroll_to.set(Some(
+            self.editor.viewport.get_untracked().origin().to_vec2(),
+        ));
+        editor
+            .editor
+            .last_movement
+            .set(self.editor.last_movement.get_untracked());
+
+        editor
+    }
+
+    pub fn id(&self) -> EditorId {
+        self.editor.id()
+    }
+
+    pub fn editor_info(&self, _data: &WindowTabData) -> EditorInfo {
+        let offset = self.cursor().get_untracked().offset();
+        let scroll_offset = self.viewport().get_untracked().origin();
+        let doc = self.doc();
+        let is_pristine = doc.is_pristine();
+        let unsaved = if is_pristine {
+            None
+        } else {
+            Some(doc.buffer.with_untracked(|b| b.to_string()))
+        };
+        EditorInfo {
+            content: self.doc().content.get_untracked(),
+            unsaved,
+            offset,
+            scroll_offset: (scroll_offset.x, scroll_offset.y),
         }
     }
 
+    pub fn cursor(&self) -> RwSignal<Cursor> {
+        self.editor.cursor
+    }
+
+    pub fn viewport(&self) -> RwSignal<Rect> {
+        self.editor.viewport
+    }
+
+    pub fn window_origin(&self) -> RwSignal<Point> {
+        self.editor.window_origin
+    }
+
+    pub fn scroll_delta(&self) -> RwSignal<Vec2> {
+        self.editor.scroll_delta
+    }
+
+    pub fn scroll_to(&self) -> RwSignal<Option<Vec2>> {
+        self.editor.scroll_to
+    }
+
+    pub fn active(&self) -> RwSignal<bool> {
+        self.editor.active
+    }
+
+    /// Get the line information for lines on the screen.  
+    pub fn screen_lines(&self) -> RwSignal<ScreenLines> {
+        self.editor.screen_lines
+    }
+
+    pub fn doc(&self) -> Rc<Doc> {
+        let doc = self.editor.doc();
+        let Ok(doc) = doc.downcast_rc() else {
+            panic!("doc is not Rc<Doc>");
+        };
+
+        doc
+    }
+
+    /// The signal for the editor's document.  
+    pub fn doc_signal(&self) -> DocSignal {
+        DocSignal {
+            inner: self.editor.doc_signal(),
+        }
+    }
+
+    pub fn text(&self) -> Rope {
+        self.editor.text()
+    }
+
+    pub fn rope_text(&self) -> RopeTextVal {
+        self.editor.rope_text()
+    }
+
     fn run_edit_command(&self, cmd: &EditCommand) -> CommandExecuted {
-        let doc = self.view.doc.get_untracked();
-        let modal = self
-            .common
-            .config
-            .with_untracked(|config| config.core.modal)
-            && !doc.content.with_untracked(|content| content.is_local());
+        let doc = self.doc();
+        let text = self.editor.rope_text();
+        let is_local = doc.content.with_untracked(|content| content.is_local());
+        let modal = self.editor.es.with_untracked(|s| s.modal()) && !is_local;
         let smart_tab = self
             .common
             .config
             .with_untracked(|config| config.editor.smart_tab);
-        let doc_before_edit =
-            doc.buffer.with_untracked(|buffer| buffer.text().clone());
-        let mut cursor = self.cursor.get_untracked();
+        let doc_before_edit = text.text().clone();
+        let mut cursor = self.editor.cursor.get_untracked();
         let mut register = self.common.register.get_untracked();
 
         let yank_data =
             if let lapce_core::cursor::CursorMode::Visual { .. } = &cursor.mode {
-                Some(
-                    self.view
-                        .doc
-                        .get_untracked()
-                        .buffer
-                        .with_untracked(|buffer| cursor.yank(buffer)),
-                )
+                Some(cursor.yank(&text))
             } else {
                 None
             };
@@ -371,8 +418,8 @@ impl EditorData {
             }
         }
 
-        self.cursor.set(cursor);
-        self.common.register.set(register);
+        self.editor.cursor.set(cursor);
+        self.editor.register.set(register);
 
         if show_completion(cmd, &doc_before_edit, &deltas) {
             self.update_completion(false);
@@ -410,17 +457,18 @@ impl EditorData {
             MotionModeCommand::MotionModeOutdent => MotionMode::Outdent,
             MotionModeCommand::MotionModeYank => MotionMode::Yank { count },
         };
-        let mut cursor = self.cursor.get_untracked();
+        let mut cursor = self.editor.cursor.get_untracked();
         let mut register = self.common.register.get_untracked();
 
         movement::do_motion_mode(
-            &self.view.doc.get_untracked(),
+            &self.editor,
+            &*self.doc(),
             &mut cursor,
             motion_mode,
             &mut register,
         );
 
-        self.cursor.set(cursor);
+        self.editor.cursor.set(cursor);
         self.common.register.set(register);
 
         CommandExecuted::Yes
@@ -430,9 +478,142 @@ impl EditorData {
         &self,
         cmd: &MultiSelectionCommand,
     ) -> CommandExecuted {
-        let mut cursor = self.cursor.get_untracked();
-        movement::do_multi_selection(&self.view, &mut cursor, cmd);
-        self.cursor.set(cursor);
+        let mut cursor = self.editor.cursor.get_untracked();
+        let rope_text = self.rope_text();
+        let doc = self.doc();
+        let config = self.common.config.get_untracked();
+
+        // This is currently special-cased in Lapce because floem editor does not have 'find'
+        match cmd {
+            MultiSelectionCommand::SelectAllCurrent => {
+                if let CursorMode::Insert(mut selection) = cursor.mode.clone() {
+                    if !selection.is_empty() {
+                        let find = doc.find();
+
+                        let first = selection.first().unwrap();
+                        let (start, end) = if first.is_caret() {
+                            rope_text.select_word(first.start)
+                        } else {
+                            (first.min(), first.max())
+                        };
+                        let search_str = rope_text.slice_to_cow(start..end);
+                        let case_sensitive = find.case_sensitive(false);
+                        let multicursor_case_sensitive =
+                            config.editor.multicursor_case_sensitive;
+                        let case_sensitive =
+                            multicursor_case_sensitive || case_sensitive;
+                        // let search_whole_word = config.editor.multicursor_whole_words;
+                        find.set_case_sensitive(case_sensitive);
+                        find.set_find(&search_str);
+                        let mut offset = 0;
+                        while let Some((start, end)) =
+                            find.next(rope_text.text(), offset, false, false)
+                        {
+                            offset = end;
+                            selection.add_region(SelRegion::new(start, end, None));
+                        }
+                    }
+                    cursor.set_insert(selection);
+                }
+            }
+            MultiSelectionCommand::SelectNextCurrent => {
+                if let CursorMode::Insert(mut selection) = cursor.mode.clone() {
+                    if !selection.is_empty() {
+                        let mut had_caret = false;
+                        for region in selection.regions_mut() {
+                            if region.is_caret() {
+                                had_caret = true;
+                                let (start, end) =
+                                    rope_text.select_word(region.start);
+                                region.start = start;
+                                region.end = end;
+                            }
+                        }
+                        if !had_caret {
+                            let find = doc.find();
+
+                            let r = selection.last_inserted().unwrap();
+                            let search_str =
+                                rope_text.slice_to_cow(r.min()..r.max());
+                            let case_sensitive = find.case_sensitive(false);
+                            let case_sensitive =
+                                config.editor.multicursor_case_sensitive
+                                    || case_sensitive;
+                            // let search_whole_word =
+                            // config.editor.multicursor_whole_words;
+                            find.set_case_sensitive(case_sensitive);
+                            find.set_find(&search_str);
+                            let mut offset = r.max();
+                            let mut seen = HashSet::new();
+                            while let Some((start, end)) =
+                                find.next(rope_text.text(), offset, false, true)
+                            {
+                                if !selection
+                                    .regions()
+                                    .iter()
+                                    .any(|r| r.min() == start && r.max() == end)
+                                {
+                                    selection.add_region(SelRegion::new(
+                                        start, end, None,
+                                    ));
+                                    break;
+                                }
+                                if seen.contains(&end) {
+                                    break;
+                                }
+                                offset = end;
+                                seen.insert(offset);
+                            }
+                        }
+                    }
+                    cursor.set_insert(selection);
+                }
+            }
+            MultiSelectionCommand::SelectSkipCurrent => {
+                if let CursorMode::Insert(mut selection) = cursor.mode.clone() {
+                    if !selection.is_empty() {
+                        let r = selection.last_inserted().unwrap();
+                        if r.is_caret() {
+                            let (start, end) = rope_text.select_word(r.start);
+                            selection.replace_last_inserted_region(SelRegion::new(
+                                start, end, None,
+                            ));
+                        } else {
+                            let find = doc.find();
+
+                            let search_str =
+                                rope_text.slice_to_cow(r.min()..r.max());
+                            find.set_find(&search_str);
+                            let mut offset = r.max();
+                            let mut seen = HashSet::new();
+                            while let Some((start, end)) =
+                                find.next(rope_text.text(), offset, false, true)
+                            {
+                                if !selection
+                                    .regions()
+                                    .iter()
+                                    .any(|r| r.min() == start && r.max() == end)
+                                {
+                                    selection.replace_last_inserted_region(
+                                        SelRegion::new(start, end, None),
+                                    );
+                                    break;
+                                }
+                                if seen.contains(&end) {
+                                    break;
+                                }
+                                offset = end;
+                                seen.insert(offset);
+                            }
+                        }
+                    }
+                    cursor.set_insert(selection);
+                }
+            }
+            _ => movement::do_multi_selection(&self.editor, &mut cursor, cmd),
+        };
+
+        self.editor.cursor.set(cursor);
         // self.cancel_signature();
         self.cancel_completion();
         self.cancel_inline_completion();
@@ -443,18 +624,20 @@ impl EditorData {
         &self,
         movement: &lapce_core::movement::Movement,
         count: Option<usize>,
-        mods: ModifiersState,
+        mods: Modifiers,
     ) -> CommandExecuted {
-        if movement.is_jump() && movement != &self.last_movement.get_untracked() {
+        self.common.hover.active.set(false);
+        if movement.is_jump()
+            && movement != &self.editor.last_movement.get_untracked()
+        {
             let path = self
-                .view
-                .doc
-                .get_untracked()
+                .doc()
                 .content
                 .with_untracked(|content| content.path().cloned());
             if let Some(path) = path {
-                let offset = self.cursor.with_untracked(|c| c.offset());
-                let scroll_offset = self.viewport.get_untracked().origin().to_vec2();
+                let offset = self.cursor().with_untracked(|c| c.offset());
+                let scroll_offset =
+                    self.viewport().get_untracked().origin().to_vec2();
                 self.common.internal_command.send(
                     InternalCommand::SaveJumpLocation {
                         path,
@@ -464,25 +647,26 @@ impl EditorData {
                 );
             }
         }
-        self.last_movement.set(movement.clone());
+        self.editor.last_movement.set(movement.clone());
 
-        let mut cursor = self.cursor.get_untracked();
+        let mut cursor = self.cursor().get_untracked();
         self.common.register.update(|register| {
             movement::move_cursor(
-                &self.view,
+                &self.editor,
+                &*self.doc(),
                 &mut cursor,
                 movement,
                 count.unwrap_or(1),
-                mods.shift_key(),
+                mods.shift(),
                 register,
             )
         });
 
-        self.cursor.set(cursor);
+        self.editor.cursor.set(cursor);
 
         if self.snippet.with_untracked(|s| s.is_some()) {
             self.snippet.update(|snippet| {
-                let offset = self.cursor.get_untracked().offset();
+                let offset = self.editor.cursor.get_untracked().offset();
                 let mut within_region = false;
                 for (_, (start, end)) in snippet.as_mut().unwrap() {
                     if offset >= *start && offset <= *end {
@@ -499,11 +683,56 @@ impl EditorData {
         CommandExecuted::Yes
     }
 
+    pub fn run_scroll_command(
+        &self,
+        cmd: &ScrollCommand,
+        count: Option<usize>,
+        mods: Modifiers,
+    ) -> CommandExecuted {
+        let prev_completion_index = self
+            .common
+            .completion
+            .with_untracked(|c| c.active.get_untracked());
+
+        match cmd {
+            ScrollCommand::PageUp => {
+                self.editor.page_move(false, mods);
+            }
+            ScrollCommand::PageDown => {
+                self.editor.page_move(true, mods);
+            }
+            ScrollCommand::ScrollUp => {
+                self.scroll(false, count.unwrap_or(1), mods);
+            }
+            ScrollCommand::ScrollDown => {
+                self.scroll(true, count.unwrap_or(1), mods);
+            }
+            // TODO:
+            ScrollCommand::CenterOfWindow => {}
+            ScrollCommand::TopOfWindow => {}
+            ScrollCommand::BottomOfWindow => {}
+        }
+
+        let current_completion_index = self
+            .common
+            .completion
+            .with_untracked(|c| c.active.get_untracked());
+
+        if prev_completion_index != current_completion_index {
+            self.common.completion.with_untracked(|c| {
+                let cursor_offset = self.cursor().with_untracked(|c| c.offset());
+                c.update_document_completion(self, cursor_offset);
+            });
+        }
+
+        CommandExecuted::Yes
+    }
+
     pub fn run_focus_command(
         &self,
         cmd: &FocusCommand,
-        count: Option<usize>,
-        mods: ModifiersState,
+        _count: Option<usize>,
+        mods: Modifiers,
     ) -> CommandExecuted {
         // TODO(minor): Evaluate whether we should split this into subenums,
         // such as actions specific to the actual editor pane, movement, and list movement.
@@ -654,7 +883,7 @@ impl EditorData {
                     self.common.internal_command.send(
                         InternalCommand::EditorTabChildClose {
                             editor_tab_id,
-                            child: EditorTabChild::Editor(self.editor_id),
+                            child: EditorTabChild::Editor(self.id()),
                         },
                     );
                 } else if let Some((editor_tab_id, diff_editor_id)) =
@@ -669,18 +898,6 @@ impl EditorData {
                 } else {
                     return CommandExecuted::No;
                 }
-            }
-            FocusCommand::PageUp => {
-                self.page_move(false, mods);
-            }
-            FocusCommand::PageDown => {
-                self.page_move(true, mods);
-            }
-            FocusCommand::ScrollUp => {
-                self.scroll(false, count.unwrap_or(1), mods);
-            }
-            FocusCommand::ScrollDown => {
-                self.scroll(true, count.unwrap_or(1), mods);
             }
             FocusCommand::ListNext => {
                 self.common.completion.update(|c| {
@@ -710,7 +927,7 @@ impl EditorData {
                 self.snippet.update(|snippet| {
                     if let Some(snippet_mut) = snippet.as_mut() {
                         let mut current = 0;
-                        let offset = self.cursor.get_untracked().offset();
+                        let offset = self.cursor().get_untracked().offset();
                         for (i, (_, (start, end))) in snippet_mut.iter().enumerate()
                         {
                             if *start <= offset && offset <= *end {
@@ -729,7 +946,7 @@ impl EditorData {
                                 *start, *end, None,
                             );
                             selection.add_region(region);
-                            self.cursor.update(|cursor| {
+                            self.cursor().update(|cursor| {
                                 cursor.set_insert(selection);
                             });
                         }
@@ -747,7 +964,7 @@ impl EditorData {
                 self.snippet.update(|snippet| {
                     if let Some(snippet_mut) = snippet.as_mut() {
                         let mut current = 0;
-                        let offset = self.cursor.get_untracked().offset();
+                        let offset = self.cursor().get_untracked().offset();
                         for (i, (_, (start, end))) in snippet_mut.iter().enumerate()
                         {
                             if *start <= offset && offset <= *end {
@@ -766,7 +983,7 @@ impl EditorData {
                                     *start, *end, None,
                                 );
                                 selection.add_region(region);
-                                self.cursor.update(|cursor| {
+                                self.cursor().update(|cursor| {
                                     cursor.set_insert(selection);
                                 });
                             }
@@ -844,6 +1061,12 @@ impl EditorData {
             FocusCommand::InlineCompletionInvoke => {
                 self.update_inline_completion(InlineCompletionTriggerKind::Invoked);
             }
+            FocusCommand::ShowHover => {
+                let start_offset = self.doc().buffer.with_untracked(|b| {
+                    b.prev_code_boundary(self.cursor().get_untracked().offset())
+                });
+                self.update_hover(start_offset);
+            }
             _ => {}
         }
 
@@ -854,8 +1077,8 @@ impl EditorData {
 
         if prev_completion_index != current_completion_index {
             self.common.completion.with_untracked(|c| {
-                let cursor_offset = self.cursor.with_untracked(|c| c.offset());
-                c.update_document_completion(&self.view, cursor_offset);
+                let cursor_offset = self.cursor().with_untracked(|c| c.offset());
+                c.update_document_completion(self, cursor_offset);
             });
         }
 
@@ -864,8 +1087,8 @@ impl EditorData {
 
     /// Jump to the next/previous column on the line which matches the given text
     fn inline_find(&self, direction: InlineFindDirection, c: &str) {
-        let offset = self.cursor.with_untracked(|c| c.offset());
-        let doc = self.view.doc.get_untracked();
+        let offset = self.cursor().with_untracked(|c| c.offset());
+        let doc = self.doc();
         let (line_content, line_start_offset) =
             doc.buffer.with_untracked(|buffer| {
                 let line = buffer.line_of_offset(offset);
@@ -898,13 +1121,13 @@ impl EditorData {
                     new_index + line_start_offset,
                 ),
                 None,
-                ModifiersState::empty(),
+                Modifiers::empty(),
             );
         }
     }
 
     fn go_to_definition(&self) {
-        let doc = self.view.doc.get_untracked();
+        let doc = self.doc();
         let path = match if doc.loaded() {
             doc.content.with_untracked(|c| c.path().cloned())
         } else {
@@ -914,7 +1137,7 @@ impl EditorData {
             None => return,
         };
 
-        let offset = self.cursor.with_untracked(|c| c.offset());
+        let offset = self.cursor().with_untracked(|c| c.offset());
         let (start_position, position) = doc.buffer.with_untracked(|buffer| {
             let start_offset = buffer.prev_code_boundary(offset);
             let start_position = buffer.offset_to_position(start_offset);
@@ -928,7 +1151,7 @@ impl EditorData {
         }
 
         let internal_command = self.common.internal_command;
-        let cursor = self.cursor.read_only();
+        let cursor = self.cursor().read_only();
         let send = create_ext_action(self.scope, move |d| {
             let current_offset = cursor.with_untracked(|c| c.offset());
             if current_offset != offset {
@@ -1042,75 +1265,13 @@ impl EditorData {
         );
     }
 
-    fn page_move(&self, down: bool, mods: ModifiersState) {
-        let config = self.common.config.get_untracked();
-        let viewport = self.viewport.get_untracked();
-        let line_height = config.editor.line_height() as f64;
-        let lines = (viewport.height() / line_height / 2.0).round() as usize;
-        let distance = (lines as f64) * line_height;
-        self.scroll_delta
-            .set(Vec2::new(0.0, if down { distance } else { -distance }));
-        self.run_move_command(
-            if down {
-                &lapce_core::movement::Movement::Down
-            } else {
-                &lapce_core::movement::Movement::Up
-            },
-            Some(lines),
+    fn scroll(&self, down: bool, count: usize, mods: Modifiers) {
+        self.editor.scroll(
+            self.sticky_header_height.get_untracked(),
+            down,
+            count,
             mods,
-        );
-    }
-
-    fn scroll(&self, down: bool, count: usize, mods: ModifiersState) {
-        let config = self.common.config.get_untracked();
-        let viewport = self.viewport.get_untracked();
-        let line_height = config.editor.line_height() as f64;
-        let diff = line_height * count as f64;
-        let diff = if down { diff } else { -diff };
-
-        let offset = self.cursor.with_untracked(|cursor| cursor.offset());
-        let (line, _col) = self
-            .view
-            .doc
-            .get_untracked()
-            .buffer
-            .with_untracked(|buffer| buffer.offset_to_line_col(offset));
-        let top = viewport.y0 + diff + self.sticky_header_height.get_untracked();
-        let bottom = viewport.y0 + diff + viewport.height();
-
-        let new_line = if (line + 1) as f64 * line_height + line_height > bottom {
-            let line = (bottom / line_height).floor() as usize;
-            if line > 2 {
-                line - 2
-            } else {
-                0
-            }
-        } else if line as f64 * line_height - line_height < top {
-            let line = (top / line_height).ceil() as usize;
-            line + 1
-        } else {
-            line
-        };
-
-        self.scroll_delta.set(Vec2::new(0.0, diff));
-
-        match new_line.cmp(&line) {
-            Ordering::Greater => {
-                self.run_move_command(
-                    &lapce_core::movement::Movement::Down,
-                    Some(new_line - line),
-                    mods,
-                );
-            }
-            Ordering::Less => {
-                self.run_move_command(
-                    &lapce_core::movement::Movement::Up,
-                    Some(line - new_line),
-                    mods,
-                );
-            }
-            _ => (),
-        };
+        )
     }
 
     fn select_inline_completion(&self) {
@@ -1163,7 +1324,7 @@ impl EditorData {
         });
     }
 
-    fn cancel_inline_completion(&self) {
+    pub fn cancel_inline_completion(&self) {
         if self
             .common
             .inline_completion
@@ -1176,7 +1337,7 @@ impl EditorData {
             c.cancel();
         });
 
-        self.view.doc.get_untracked().clear_inline_completion();
+        self.doc().clear_inline_completion();
     }
 
     /// Update the current inline completion
@@ -1186,7 +1347,7 @@ impl EditorData {
             return;
         }
 
-        let doc = self.view.doc.get_untracked();
+        let doc = self.doc();
         let path = match if doc.loaded() {
             doc.content.with_untracked(|c| c.path().cloned())
         } else {
@@ -1196,7 +1357,7 @@ impl EditorData {
             None => return,
         };
 
-        let offset = self.cursor.with_untracked(|c| c.offset());
+        let offset = self.cursor().with_untracked(|c| c.offset());
         let line = doc
             .buffer
             .with_untracked(|buffer| buffer.line_of_offset(offset));
@@ -1205,7 +1366,7 @@ impl EditorData {
             .with_untracked(|buffer| buffer.offset_to_position(offset));
 
         let inline_completion = self.common.inline_completion;
-        let doc = self.view.doc.get_untracked();
+        let doc = self.doc();
 
         // Update the inline completion's text if it's already active to avoid flickering
         let has_relevant = inline_completion.with_untracked(|completion| {
@@ -1272,23 +1433,23 @@ impl EditorData {
         })
     }
 
-    fn select_completion(&self) {
+    pub fn select_completion(&self) {
         let item = self
             .common
             .completion
             .with_untracked(|c| c.current_item().cloned());
         self.cancel_completion();
-        let doc = self.view.doc.get_untracked();
+        let doc = self.doc();
         if let Some(item) = item {
             if item.item.data.is_some() {
                 let editor = self.clone();
                 let rev = doc.buffer.with_untracked(|buffer| buffer.rev());
                 let path = doc.content.with_untracked(|c| c.path().cloned());
-                let offset = self.cursor.with_untracked(|c| c.offset());
+                let offset = self.cursor().with_untracked(|c| c.offset());
                 let buffer = doc.buffer;
                 let content = doc.content;
                 let send = create_ext_action(self.scope, move |item| {
-                    if editor.cursor.with_untracked(|c| c.offset() != offset) {
+                    if editor.cursor().with_untracked(|c| c.offset() != offset) {
                         return;
                     }
                     if buffer.with_untracked(|b| b.rev()) != rev
@@ -1332,9 +1493,7 @@ impl EditorData {
             c.cancel();
         });
 
-        self.view
-            .doc
-            .with_untracked(|doc| doc.clear_completion_lens());
+        self.doc().clear_completion_lens()
     }
 
     /// Update the displayed autocompletion box
@@ -1345,7 +1504,7 @@ impl EditorData {
             return;
         }
 
-        let doc = self.view.doc.get_untracked();
+        let doc = self.doc();
         let path = match if doc.loaded() {
             doc.content.with_untracked(|c| c.path().cloned())
         } else {
@@ -1355,7 +1514,7 @@ impl EditorData {
             None => return,
         };
 
-        let offset = self.cursor.with_untracked(|c| c.offset());
+        let offset = self.cursor().with_untracked(|c| c.offset());
         let (start_offset, input, char) = doc.buffer.with_untracked(|buffer| {
             let start_offset = buffer.prev_code_boundary(offset);
             let end_offset = buffer.next_code_boundary(offset);
@@ -1388,7 +1547,7 @@ impl EditorData {
                         buffer.offset_to_position(start_offset)
                     });
                     completion.request(
-                        self.editor_id,
+                        self.id(),
                         &self.common.proxy,
                         path.clone(),
                         "".to_string(),
@@ -1401,7 +1560,7 @@ impl EditorData {
                         .buffer
                         .with_untracked(|buffer| buffer.offset_to_position(offset));
                     completion.request(
-                        self.editor_id,
+                        self.id(),
                         &self.common.proxy,
                         path,
                         input,
@@ -1409,20 +1568,20 @@ impl EditorData {
                     );
                 }
             });
-            let cursor_offset = self.cursor.with_untracked(|c| c.offset());
+            let cursor_offset = self.cursor().with_untracked(|c| c.offset());
             self.common
                 .completion
                 .get_untracked()
-                .update_document_completion(&self.view, cursor_offset);
+                .update_document_completion(self, cursor_offset);
 
             return;
         }
 
-        let doc = self.view.doc.get_untracked();
+        let doc = self.doc();
         self.common.completion.update(|completion| {
-            completion.path = path.clone();
+            completion.path.clone_from(&path);
             completion.offset = start_offset;
-            completion.input = input.clone();
+            completion.input.clone_from(&input);
             completion.status = CompletionStatus::Started;
             completion.input_items.clear();
             completion.request_id += 1;
@@ -1430,7 +1589,7 @@ impl EditorData {
                 .buffer
                 .with_untracked(|buffer| buffer.offset_to_position(start_offset));
             completion.request(
-                self.editor_id,
+                self.id(),
                 &self.common.proxy,
                 path.clone(),
                 "".to_string(),
@@ -1442,7 +1601,7 @@ impl EditorData {
                     .buffer
                     .with_untracked(|buffer| buffer.offset_to_position(offset));
                 completion.request(
-                    self.editor_id,
+                    self.id(),
                     &self.common.proxy,
                     path,
                     input,
@@ -1460,10 +1619,10 @@ impl EditorData {
         })
     }
 
-    fn apply_completion_item(&self, item: &CompletionItem) -> Result<()> {
-        let doc = self.view.doc.get_untracked();
+    fn apply_completion_item(&self, item: &CompletionItem) -> anyhow::Result<()> {
+        let doc = self.doc();
         let buffer = doc.buffer.get_untracked();
-        let cursor = self.cursor.get_untracked();
+        let cursor = self.cursor().get_untracked();
         // Get all the edits which would be applied in places other than right where the cursor is
         let additional_edit: Vec<_> = item
             .additional_text_edits
@@ -1548,15 +1707,13 @@ impl EditorData {
         selection: &Selection,
         additional_edit: Vec<(Selection, &str)>,
         start_offset: usize,
-    ) -> Result<()> {
+    ) -> anyhow::Result<()> {
         let snippet = Snippet::from_str(snippet)?;
         let text = snippet.text();
-        let mut cursor = self.cursor.get_untracked();
+        let mut cursor = self.cursor().get_untracked();
         let old_cursor = cursor.mode.clone();
-        let (delta, inval_lines, edits) = self
-            .view
-            .doc
-            .get_untracked()
+        let (b_text, delta, inval_lines) = self
+            .doc()
             .do_raw_edit(
                 &[
                     &[(selection.clone(), text.as_str())][..],
@@ -1573,15 +1730,15 @@ impl EditorData {
         let offset = transformer.transform(start_offset, false);
         let snippet_tabs = snippet.tabs(offset);
 
-        let doc = self.view.doc.get_untracked();
+        let doc = self.doc();
         if snippet_tabs.is_empty() {
             doc.buffer.update(|buffer| {
                 cursor.update_selection(buffer, selection);
                 buffer.set_cursor_before(old_cursor);
                 buffer.set_cursor_after(cursor.mode.clone());
             });
-            self.cursor.set(cursor);
-            self.apply_deltas(&[(delta, inval_lines, edits)]);
+            self.cursor().set(cursor);
+            self.apply_deltas(&[(b_text, delta, inval_lines)]);
             return Ok(());
         }
 
@@ -1595,8 +1752,8 @@ impl EditorData {
             buffer.set_cursor_before(old_cursor);
             buffer.set_cursor_after(cursor.mode.clone());
         });
-        self.cursor.set(cursor);
-        self.apply_deltas(&[(delta, inval_lines, edits)]);
+        self.cursor().set(cursor);
+        self.apply_deltas(&[(b_text, delta, inval_lines)]);
         self.add_snippet_placeholders(snippet_tabs);
         Ok(())
     }
@@ -1616,7 +1773,7 @@ impl EditorData {
             let placeholders = snippet.as_mut().unwrap();
 
             let mut current = 0;
-            let offset = self.cursor.get_untracked().offset();
+            let offset = self.cursor().get_untracked().offset();
             for (i, (_, (start, end))) in placeholders.iter().enumerate() {
                 if *start <= offset && offset <= *end {
                     current = i;
@@ -1635,9 +1792,9 @@ impl EditorData {
         selection: &Selection,
         edits: &[(impl AsRef<Selection>, &str)],
     ) {
-        let mut cursor = self.cursor.get_untracked();
-        let doc = self.view.doc.get_untracked();
-        let (delta, inval_lines, edits) =
+        let mut cursor = self.cursor().get_untracked();
+        let doc = self.doc();
+        let (text, delta, inval_lines) =
             match doc.do_raw_edit(edits, EditType::Completion) {
                 Some(e) => e,
                 None => return,
@@ -1649,40 +1806,35 @@ impl EditorData {
             buffer.set_cursor_before(old_cursor);
             buffer.set_cursor_after(cursor.mode.clone());
         });
-        self.cursor.set(cursor);
+        self.cursor().set(cursor);
 
-        self.apply_deltas(&[(delta, inval_lines, edits)]);
+        self.apply_deltas(&[(text, delta, inval_lines)]);
     }
 
     pub fn do_text_edit(&self, edits: &[TextEdit]) {
-        let (selection, edits) = self
-            .view
-            .doc
-            .get_untracked()
-            .buffer
-            .with_untracked(|buffer| {
-                let selection = self.cursor.get_untracked().edit_selection(buffer);
-                let edits = edits
-                    .iter()
-                    .map(|edit| {
-                        let selection = lapce_core::selection::Selection::region(
-                            buffer.offset_of_position(&edit.range.start),
-                            buffer.offset_of_position(&edit.range.end),
-                        );
-                        (selection, edit.new_text.as_str())
-                    })
-                    .collect::<Vec<_>>();
-                (selection, edits)
-            });
+        let (selection, edits) = self.doc().buffer.with_untracked(|buffer| {
+            let selection = self.cursor().get_untracked().edit_selection(buffer);
+            let edits = edits
+                .iter()
+                .map(|edit| {
+                    let selection = lapce_core::selection::Selection::region(
+                        buffer.offset_of_position(&edit.range.start),
+                        buffer.offset_of_position(&edit.range.end),
+                    );
+                    (selection, edit.new_text.as_str())
+                })
+                .collect::<Vec<_>>();
+            (selection, edits)
+        });
 
         self.do_edit(&selection, &edits);
     }
 
-    fn apply_deltas(&self, deltas: &[(RopeDelta, InvalLines, SyntaxEdit)]) {
+    fn apply_deltas(&self, deltas: &[(Rope, RopeDelta, InvalLines)]) {
         if !deltas.is_empty() && !self.confirmed.get_untracked() {
             self.confirmed.set(true);
         }
-        for (delta, _, _) in deltas {
+        for (_, delta, _) in deltas {
             // self.inactive_apply_delta(delta);
             self.update_snippet_offset(delta);
             // self.update_breakpoints(delta);
@@ -1745,7 +1897,7 @@ impl EditorData {
         if !new_doc {
             self.do_go_to_location(location, edits);
         } else {
-            let loaded = self.view.doc.with_untracked(|d| d.loaded);
+            let loaded = self.doc().loaded;
             let editor = self.clone();
             self.scope.create_effect(move |prev_loaded| {
                 if prev_loaded == Some(true) {
@@ -1768,19 +1920,17 @@ impl EditorData {
         edits: Option<Vec<TextEdit>>,
     ) {
         let offset = self
-            .view
-            .doc
-            .get_untracked()
+            .doc()
             .buffer
             .with_untracked(|buffer| position.to_offset(buffer));
         let config = self.common.config.get_untracked();
-        self.cursor.set(if config.core.modal {
+        self.cursor().set(if config.core.modal {
             Cursor::new(CursorMode::Normal(offset), None, None)
         } else {
             Cursor::new(CursorMode::Insert(Selection::caret(offset)), None, None)
         });
         if let Some(scroll_offset) = scroll_offset {
-            self.scroll_to.set(Some(scroll_offset));
+            self.editor.scroll_to.set(Some(scroll_offset));
         }
         if let Some(edits) = edits.as_ref() {
             self.do_text_edit(edits);
@@ -1788,7 +1938,7 @@ impl EditorData {
     }
 
     pub fn get_code_actions(&self) {
-        let doc = self.view.doc.get_untracked();
+        let doc = self.doc();
         let path = match if doc.loaded() {
             doc.content.with_untracked(|c| c.path().cloned())
         } else {
@@ -1798,7 +1948,7 @@ impl EditorData {
             None => return,
         };
 
-        let offset = self.cursor.with_untracked(|c| c.offset());
+        let offset = self.cursor().with_untracked(|c| c.offset());
         let exists = doc
             .code_actions()
             .with_untracked(|c| c.contains_key(&offset));
@@ -1820,14 +1970,11 @@ impl EditorData {
             // what code actions are available (such as fixes for the diagnostics).
             let diagnostics = doc
                 .diagnostics()
-                .diagnostics
+                .diagnostics_span
                 .get_untracked()
-                .iter()
-                .map(|x| &x.diagnostic)
-                .filter(|x| {
-                    x.range.start.line <= position.line
-                        && x.range.end.line >= position.line
-                })
+                .iter_chunks(offset..offset)
+                .filter(|(iv, _diag)| iv.start <= offset && iv.end >= offset)
+                .map(|(_iv, diag)| diag)
                 .cloned()
                 .collect();
 
@@ -1859,8 +2006,8 @@ impl EditorData {
     }
 
     pub fn show_code_actions(&self, mouse_click: bool) {
-        let offset = self.cursor.with_untracked(|c| c.offset());
-        let doc = self.view.doc.get_untracked();
+        let offset = self.cursor().with_untracked(|c| c.offset());
+        let doc = self.doc();
         let code_actions = doc
             .code_actions()
             .with_untracked(|c| c.get(&offset).cloned());
@@ -1877,24 +2024,23 @@ impl EditorData {
         }
     }
 
-    fn do_save(&self, after_action: impl Fn() + 'static) {
-        self.view.doc.get_untracked().save(after_action);
+    fn do_save(&self, after_action: impl FnOnce() + 'static) {
+        self.doc().save(after_action);
     }
 
     pub fn save(
         &self,
         allow_formatting: bool,
-        after_action: impl Fn() + 'static + Copy,
+        after_action: impl FnOnce() + 'static,
     ) {
-        let doc = self.view.doc.get_untracked();
-        let rev = doc.rev();
+        let doc = self.doc();
         let is_pristine = doc.is_pristine();
         let content = doc.content.get_untracked();
 
         if let DocContent::Scratch { .. } = &content {
             self.common
                 .internal_command
-                .send(InternalCommand::SaveScratchDoc { doc });
+                .send(InternalCommand::SaveScratchDoc2 { doc });
             return;
         }
 
@@ -1903,40 +2049,49 @@ impl EditorData {
         }
 
         let config = self.common.config.get_untracked();
-        if let DocContent::File { path, .. } = content {
-            let format_on_save = allow_formatting && config.editor.format_on_save;
-            if format_on_save {
-                let editor = self.clone();
-                let send = create_ext_action(self.scope, move |result| {
-                    if let Ok(Ok(ProxyResponse::GetDocumentFormatting { edits })) =
-                        result
-                    {
-                        let current_rev =
-                            editor.view.doc.with_untracked(|doc| doc.rev());
-                        if current_rev == rev {
-                            editor.do_text_edit(&edits);
-                        }
-                    }
-                    editor.do_save(after_action);
-                });
+        let DocContent::File { path, .. } = content else {
+            return;
+        };
 
-                let (tx, rx) = crossbeam_channel::bounded(1);
-                let proxy = self.common.proxy.clone();
-                std::thread::spawn(move || {
-                    proxy.get_document_formatting(path, move |result| {
-                        let _ = tx.send(result);
-                    });
-                    let result = rx.recv_timeout(std::time::Duration::from_secs(1));
-                    send(result);
+        // If we are disallowing formatting (such as due to a manual save without formatting),
+        // then we skip normalizing line endings as a common reason for that is large files.
+        // (but if the save is typical, even if config format_on_save is false, we normalize)
+        if allow_formatting && config.editor.normalize_line_endings {
+            self.run_edit_command(&EditCommand::NormalizeLineEndings);
+        }
+
+        let rev = doc.rev();
+        let format_on_save = allow_formatting && config.editor.format_on_save;
+        if format_on_save {
+            let editor = self.clone();
+            let send = create_ext_action(self.scope, move |result| {
+                if let Ok(Ok(ProxyResponse::GetDocumentFormatting { edits })) =
+                    result
+                {
+                    let current_rev = editor.doc().rev();
+                    if current_rev == rev {
+                        editor.do_text_edit(&edits);
+                    }
+                }
+                editor.do_save(after_action);
+            });
+
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            let proxy = self.common.proxy.clone();
+            std::thread::spawn(move || {
+                proxy.get_document_formatting(path, move |result| {
+                    let _ = tx.send(result);
                 });
-            } else {
-                self.do_save(after_action);
-            }
+                let result = rx.recv_timeout(std::time::Duration::from_secs(1));
+                send(result);
+            });
+        } else {
+            self.do_save(after_action);
         }
     }
 
     pub fn format(&self) {
-        let doc = self.view.doc.get_untracked();
+        let doc = self.doc();
         let rev = doc.rev();
         let content = doc.content.get_untracked();
 
@@ -1946,8 +2101,7 @@ impl EditorData {
                 if let Ok(Ok(ProxyResponse::GetDocumentFormatting { edits })) =
                     result
                 {
-                    let current_rev =
-                        editor.view.doc.with_untracked(|doc| doc.rev());
+                    let current_rev = editor.doc().rev();
                     if current_rev == rev {
                         editor.do_text_edit(&edits);
                     }
@@ -1966,17 +2120,12 @@ impl EditorData {
         }
     }
 
-    fn search_whole_word_forward(&self, mods: ModifiersState) {
-        let offset = self.cursor.with_untracked(|c| c.offset());
-        let (word, buffer) =
-            self.view
-                .doc
-                .get_untracked()
-                .buffer
-                .with_untracked(|buffer| {
-                    let (start, end) = buffer.select_word(offset);
-                    (buffer.slice_to_cow(start..end).to_string(), buffer.clone())
-                });
+    fn search_whole_word_forward(&self, mods: Modifiers) {
+        let offset = self.cursor().with_untracked(|c| c.offset());
+        let (word, buffer) = self.doc().buffer.with_untracked(|buffer| {
+            let (start, end) = buffer.select_word(offset);
+            (buffer.slice_to_cow(start..end).to_string(), buffer.clone())
+        });
         self.common.internal_command.send(InternalCommand::Search {
             pattern: Some(word),
         });
@@ -1991,12 +2140,10 @@ impl EditorData {
         }
     }
 
-    fn search_forward(&self, mods: ModifiersState) {
-        let offset = self.cursor.with_untracked(|c| c.offset());
+    fn search_forward(&self, mods: Modifiers) {
+        let offset = self.cursor().with_untracked(|c| c.offset());
         let text = self
-            .view
-            .doc
-            .get_untracked()
+            .doc()
             .buffer
             .with_untracked(|buffer| buffer.text().clone());
         let next = self.common.find.next(&text, offset, false, true);
@@ -2010,12 +2157,10 @@ impl EditorData {
         }
     }
 
-    fn search_backward(&self, mods: ModifiersState) {
-        let offset = self.cursor.with_untracked(|c| c.offset());
+    fn search_backward(&self, mods: Modifiers) {
+        let offset = self.cursor().with_untracked(|c| c.offset());
         let text = self
-            .view
-            .doc
-            .get_untracked()
+            .doc()
             .buffer
             .with_untracked(|buffer| buffer.text().clone());
         let next = self.common.find.next(&text, offset, true, true);
@@ -2030,13 +2175,8 @@ impl EditorData {
     }
 
     fn replace_next(&self, text: &str) {
-        let offset = self.cursor.with_untracked(|c| c.offset());
-        let buffer = self
-            .view
-            .doc
-            .get_untracked()
-            .buffer
-            .with_untracked(|buffer| buffer.clone());
+        let offset = self.cursor().with_untracked(|c| c.offset());
+        let buffer = self.doc().buffer.with_untracked(|buffer| buffer.clone());
         let next = self.common.find.next(buffer.text(), offset, false, true);
 
         if let Some((start, end)) = next {
@@ -2046,13 +2186,13 @@ impl EditorData {
     }
 
     fn replace_all(&self, text: &str) {
-        let offset = self.cursor.with_untracked(|c| c.offset());
+        let offset = self.cursor().with_untracked(|c| c.offset());
 
-        self.view.update_find();
+        self.doc().update_find();
 
         let edits: Vec<(Selection, &str)> = self
-            .view
-            .find_result()
+            .doc()
+            .find_result
             .occurrences
             .get_untracked()
             .regions()
@@ -2065,7 +2205,7 @@ impl EditorData {
     }
 
     pub fn save_doc_position(&self) {
-        let doc = self.view.doc.get_untracked();
+        let doc = self.doc();
         let path = match if doc.loaded() {
             doc.content.with_untracked(|c| c.path().cloned())
         } else {
@@ -2075,8 +2215,8 @@ impl EditorData {
             None => return,
         };
 
-        let cursor_offset = self.cursor.with_untracked(|c| c.offset());
-        let scroll_offset = self.viewport.with_untracked(|v| v.origin().to_vec2());
+        let cursor_offset = self.cursor().with_untracked(|c| c.offset());
+        let scroll_offset = self.viewport().with_untracked(|v| v.origin().to_vec2());
 
         let db: Arc<LapceDb> = use_context().unwrap();
         db.save_doc_position(
@@ -2088,7 +2228,7 @@ impl EditorData {
     }
 
     fn rename(&self) {
-        let doc = self.view.doc.get_untracked();
+        let doc = self.doc();
         let path = match if doc.loaded() {
             doc.content.with_untracked(|c| c.path().cloned())
         } else {
@@ -2098,12 +2238,12 @@ impl EditorData {
             None => return,
         };
 
-        let offset = self.cursor.with_untracked(|c| c.offset());
+        let offset = self.cursor().with_untracked(|c| c.offset());
         let (position, rev) = doc
             .buffer
             .with_untracked(|buffer| (buffer.offset_to_position(offset), doc.rev()));
 
-        let cursor = self.cursor;
+        let cursor = self.cursor();
         let buffer = doc.buffer;
         let internal_command = self.common.internal_command;
         let local_path = path.clone();
@@ -2169,7 +2309,8 @@ impl EditorData {
     }
 
     pub fn word_at_cursor(&self) -> String {
-        let region = self.cursor.with_untracked(|c| match &c.mode {
+        let doc = self.doc();
+        let region = self.cursor().with_untracked(|c| match &c.mode {
             lapce_core::cursor::CursorMode::Normal(offset) => {
                 lapce_core::selection::SelRegion::caret(*offset)
             }
@@ -2179,13 +2320,9 @@ impl EditorData {
                 mode: _,
             } => lapce_core::selection::SelRegion::new(
                 *start.min(end),
-                self.view
-                    .doc
-                    .get_untracked()
-                    .buffer
-                    .with_untracked(|buffer| {
-                        buffer.next_grapheme_offset(*start.max(end), 1, buffer.len())
-                    }),
+                doc.buffer.with_untracked(|buffer| {
+                    buffer.next_grapheme_offset(*start.max(end), 1, buffer.len())
+                }),
                 None,
             ),
             lapce_core::cursor::CursorMode::Insert(selection) => {
@@ -2194,22 +2331,14 @@ impl EditorData {
         });
 
         if region.is_caret() {
-            self.view
-                .doc
-                .get_untracked()
-                .buffer
-                .with_untracked(|buffer| {
-                    let (start, end) = buffer.select_word(region.start);
-                    buffer.slice_to_cow(start..end).to_string()
-                })
+            doc.buffer.with_untracked(|buffer| {
+                let (start, end) = buffer.select_word(region.start);
+                buffer.slice_to_cow(start..end).to_string()
+            })
         } else {
-            self.view
-                .doc
-                .get_untracked()
-                .buffer
-                .with_untracked(|buffer| {
-                    buffer.slice_to_cow(region.min()..region.max()).to_string()
-                })
+            doc.buffer.with_untracked(|buffer| {
+                buffer.slice_to_cow(region.min()..region.max()).to_string()
+            })
         }
     }
 
@@ -2236,15 +2365,15 @@ impl EditorData {
     }
 
     pub fn pointer_down(&self, pointer_event: &PointerInputEvent) {
+        self.cancel_completion();
+        self.cancel_inline_completion();
         if let Some(editor_tab_id) = self.editor_tab_id.get_untracked() {
             self.common
                 .internal_command
                 .send(InternalCommand::FocusEditorTab { editor_tab_id });
         }
         if self
-            .view
-            .doc
-            .get_untracked()
+            .doc()
             .content
             .with_untracked(|content| !content.is_local())
         {
@@ -2253,7 +2382,7 @@ impl EditorData {
         }
         match pointer_event.button {
             PointerButton::Primary => {
-                self.active.set(true);
+                self.active().set(true);
                 self.left_click(pointer_event);
             }
             PointerButton::Secondary => {
@@ -2279,69 +2408,36 @@ impl EditorData {
     }
 
     fn single_click(&self, pointer_event: &PointerInputEvent) {
-        let mode = self.cursor.with_untracked(|c| c.get_mode());
-        let (new_offset, _) = self.view.offset_of_point(mode, pointer_event.pos);
-        self.cursor.update(|cursor| {
-            cursor.set_offset(
-                new_offset,
-                pointer_event.modifiers.shift_key(),
-                pointer_event.modifiers.alt_key(),
-            )
-        });
+        self.editor.single_click(pointer_event);
     }
 
     fn double_click(&self, pointer_event: &PointerInputEvent) {
-        let mode = self.cursor.with_untracked(|c| c.get_mode());
-        let (mouse_offset, _) = self.view.offset_of_point(mode, pointer_event.pos);
-        let (start, end) = self.view.select_word(mouse_offset);
-
-        self.cursor.update(|cursor| {
-            cursor.add_region(
-                start,
-                end,
-                pointer_event.modifiers.shift_key(),
-                pointer_event.modifiers.alt_key(),
-            )
-        });
+        self.editor.double_click(pointer_event);
     }
 
     fn triple_click(&self, pointer_event: &PointerInputEvent) {
-        let mode = self.cursor.with_untracked(|c| c.get_mode());
-        let (mouse_offset, _) = self.view.offset_of_point(mode, pointer_event.pos);
-        let line = self.view.line_of_offset(mouse_offset);
-        let start = self.view.offset_of_line(line);
-        let end = self.view.offset_of_line(line + 1);
-
-        self.cursor.update(|cursor| {
-            cursor.add_region(
-                start,
-                end,
-                pointer_event.modifiers.shift_key(),
-                pointer_event.modifiers.alt_key(),
-            )
-        });
+        self.editor.triple_click(pointer_event);
     }
 
     pub fn pointer_move(&self, pointer_event: &PointerMoveEvent) {
-        let mode = self.cursor.with_untracked(|c| c.get_mode());
-        let (offset, is_inside) = self.view.offset_of_point(mode, pointer_event.pos);
-        if self.active.get_untracked()
-            && self.cursor.with_untracked(|c| c.offset()) != offset
+        let mode = self.cursor().with_untracked(|c| c.get_mode());
+        let (offset, is_inside) =
+            self.editor.offset_of_point(mode, pointer_event.pos);
+        if self.active().get_untracked()
+            && self.cursor().with_untracked(|c| c.offset()) != offset
         {
-            self.cursor.update(|cursor| {
-                cursor.set_offset(offset, true, pointer_event.modifiers.alt_key())
+            self.cursor().update(|cursor| {
+                cursor.set_offset(offset, true, pointer_event.modifiers.alt())
             });
         }
         if self.common.hover.active.get_untracked() {
             let hover_editor_id = self.common.hover.editor_id.get_untracked();
-            if hover_editor_id != self.editor_id {
+            if hover_editor_id != self.id() {
                 self.common.hover.active.set(false);
             } else {
                 let current_offset = self.common.hover.offset.get_untracked();
                 let start_offset = self
-                    .view
-                    .doc
-                    .get_untracked()
+                    .doc()
                     .buffer
                     .with_untracked(|buffer| buffer.prev_code_boundary(offset));
                 if current_offset != start_offset {
@@ -2353,9 +2449,7 @@ impl EditorData {
         if hover_delay > 0 {
             if is_inside {
                 let start_offset = self
-                    .view
-                    .doc
-                    .get_untracked()
+                    .doc()
                     .buffer
                     .with_untracked(|buffer| buffer.prev_code_boundary(offset));
 
@@ -2376,8 +2470,8 @@ impl EditorData {
         }
     }
 
-    pub fn pointer_up(&self, _pointer_event: &PointerInputEvent) {
-        self.active.set(false);
+    pub fn pointer_up(&self, pointer_event: &PointerInputEvent) {
+        self.editor.pointer_up(pointer_event);
     }
 
     pub fn pointer_leave(&self) {
@@ -2385,11 +2479,11 @@ impl EditorData {
     }
 
     fn right_click(&self, pointer_event: &PointerInputEvent) {
-        let mode = self.cursor.with_untracked(|c| c.get_mode());
-        let (offset, _) = self.view.offset_of_point(mode, pointer_event.pos);
-        let doc = self.view.doc.get_untracked();
+        let mode = self.cursor().with_untracked(|c| c.get_mode());
+        let (offset, _) = self.editor.offset_of_point(mode, pointer_event.pos);
+        let doc = self.doc();
         let pointer_inside_selection = doc.buffer.with_untracked(|buffer| {
-            self.cursor
+            self.cursor()
                 .with_untracked(|c| c.edit_selection(buffer).contains(offset))
         });
         if !pointer_inside_selection {
@@ -2446,7 +2540,7 @@ impl EditorData {
     }
 
     fn update_hover(&self, offset: usize) {
-        let doc = self.view.doc.get_untracked();
+        let doc = self.doc();
         let path = doc
             .content
             .with_untracked(|content| content.path().cloned());
@@ -2459,7 +2553,7 @@ impl EditorData {
         };
         let config = self.common.config;
         let hover_data = self.common.hover.clone();
-        let editor_id = self.editor_id;
+        let editor_id = self.id();
         let send = create_ext_action(self.scope, move |resp| {
             if let Ok(ProxyResponse::HoverResponse { hover, .. }) = resp {
                 let content = parse_hover_resp(hover, &config.get_untracked());
@@ -2476,15 +2570,205 @@ impl EditorData {
 
     // reset the doc inside and move cursor back
     pub fn reset(&self) {
-        let doc = self.view.doc.get_untracked();
+        let doc = self.doc();
         doc.reload(Rope::from(""), true);
-        self.cursor
+        self.cursor()
             .update(|cursor| cursor.set_offset(0, false, false));
     }
 
-    /// Get the line information for lines on the screen.  
-    pub fn screen_lines(&self) -> RwSignal<ScreenLines> {
-        self.view.screen_lines
+    pub fn visual_line(&self, line: usize) -> usize {
+        self.kind.with_untracked(|kind| match kind {
+            EditorViewKind::Normal => line,
+            EditorViewKind::Diff(diff) => {
+                let is_right = diff.is_right;
+                let mut last_change: Option<&DiffLines> = None;
+                let mut visual_line = 0;
+                let mut changes = diff.changes.iter().peekable();
+                while let Some(change) = changes.next() {
+                    match (is_right, change) {
+                        (true, DiffLines::Left(range)) => {
+                            if let Some(DiffLines::Right(_)) = changes.peek() {
+                            } else {
+                                visual_line += range.len();
+                            }
+                        }
+                        (false, DiffLines::Right(range)) => {
+                            let len = if let Some(DiffLines::Left(r)) = last_change {
+                                range.len() - r.len().min(range.len())
+                            } else {
+                                range.len()
+                            };
+                            if len > 0 {
+                                visual_line += len;
+                            }
+                        }
+                        (true, DiffLines::Right(range))
+                        | (false, DiffLines::Left(range)) => {
+                            if line < range.end {
+                                return visual_line + line - range.start;
+                            }
+                            visual_line += range.len();
+                            if is_right {
+                                if let Some(DiffLines::Left(r)) = last_change {
+                                    let len = r.len() - r.len().min(range.len());
+                                    if len > 0 {
+                                        visual_line += len;
+                                    }
+                                }
+                            }
+                        }
+                        (_, DiffLines::Both(info)) => {
+                            let end = if is_right {
+                                info.right.end
+                            } else {
+                                info.left.end
+                            };
+                            if line >= end {
+                                visual_line += info.right.len()
+                                    - info
+                                        .skip
+                                        .as_ref()
+                                        .map(|skip| skip.len().saturating_sub(1))
+                                        .unwrap_or(0);
+                                last_change = Some(change);
+                                continue;
+                            }
+
+                            let start = if is_right {
+                                info.right.start
+                            } else {
+                                info.left.start
+                            };
+                            if let Some(skip) = info.skip.as_ref() {
+                                if start + skip.start > line {
+                                    return visual_line + line - start;
+                                } else if start + skip.end > line {
+                                    return visual_line + skip.start;
+                                } else {
+                                    return visual_line
+                                        + (line - start - skip.len() + 1);
+                                }
+                            } else {
+                                return visual_line + line - start;
+                            }
+                        }
+                    }
+                    last_change = Some(change);
+                }
+                visual_line
+            }
+        })
+    }
+
+    pub fn actual_line(&self, visual_line: usize, bottom_affinity: bool) -> usize {
+        self.kind.with_untracked(|kind| match kind {
+            EditorViewKind::Normal => visual_line,
+            EditorViewKind::Diff(diff) => {
+                let is_right = diff.is_right;
+                let mut actual_line: usize = 0;
+                let mut current_visual_line = 0;
+                let mut last_change: Option<&DiffLines> = None;
+                let mut changes = diff.changes.iter().peekable();
+                while let Some(change) = changes.next() {
+                    match (is_right, change) {
+                        (true, DiffLines::Left(range)) => {
+                            if let Some(DiffLines::Right(_)) = changes.peek() {
+                            } else {
+                                current_visual_line += range.len();
+                                if current_visual_line >= visual_line {
+                                    return if bottom_affinity {
+                                        actual_line
+                                    } else {
+                                        actual_line.saturating_sub(1)
+                                    };
+                                }
+                            }
+                        }
+                        (false, DiffLines::Right(range)) => {
+                            let len = if let Some(DiffLines::Left(r)) = last_change {
+                                range.len() - r.len().min(range.len())
+                            } else {
+                                range.len()
+                            };
+                            if len > 0 {
+                                current_visual_line += len;
+                                if current_visual_line >= visual_line {
+                                    return actual_line;
+                                }
+                            }
+                        }
+                        (true, DiffLines::Right(range))
+                        | (false, DiffLines::Left(range)) => {
+                            let len = range.len();
+                            if current_visual_line + len > visual_line {
+                                return range.start
+                                    + (visual_line - current_visual_line);
+                            }
+                            current_visual_line += len;
+                            actual_line += len;
+                            if is_right {
+                                if let Some(DiffLines::Left(r)) = last_change {
+                                    let len = r.len() - r.len().min(range.len());
+                                    if len > 0 {
+                                        current_visual_line += len;
+                                        if current_visual_line > visual_line {
+                                            return if bottom_affinity {
+                                                actual_line
+                                            } else {
+                                                actual_line - range.len()
+                                            };
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        (_, DiffLines::Both(info)) => {
+                            let len = info.right.len();
+                            let start = if is_right {
+                                info.right.start
+                            } else {
+                                info.left.start
+                            };
+
+                            if let Some(skip) = info.skip.as_ref() {
+                                if current_visual_line + skip.start == visual_line {
+                                    return if bottom_affinity {
+                                        actual_line + skip.end
+                                    } else {
+                                        (actual_line + skip.start).saturating_sub(1)
+                                    };
+                                } else if current_visual_line + skip.start + 1
+                                    > visual_line
+                                {
+                                    return actual_line + visual_line
+                                        - current_visual_line;
+                                } else if current_visual_line + len - skip.len() + 1
+                                    >= visual_line
+                                {
+                                    return actual_line
+                                        + skip.end
+                                        + (visual_line
+                                            - current_visual_line
+                                            - skip.start
+                                            - 1);
+                                }
+                                actual_line += len;
+                                current_visual_line += len - skip.len() + 1;
+                            } else {
+                                if current_visual_line + len > visual_line {
+                                    return start
+                                        + (visual_line - current_visual_line);
+                                }
+                                current_visual_line += len;
+                                actual_line += len;
+                            }
+                        }
+                    }
+                    last_change = Some(change);
+                }
+                actual_line
+            }
+        })
     }
 }
 
@@ -2494,7 +2778,7 @@ impl KeyPressFocus for EditorData {
         {
             Mode::Insert
         } else {
-            self.cursor.with_untracked(|c| c.get_mode())
+            self.cursor().with_untracked(|c| c.get_mode())
         }
     }
 
@@ -2509,9 +2793,7 @@ impl KeyPressFocus for EditorData {
             Condition::InlineCompletionVisible => self.has_inline_completions(),
             Condition::InSnippet => self.snippet.with_untracked(|s| s.is_some()),
             Condition::EditorFocus => self
-                .view
-                .doc
-                .get_untracked()
+                .doc()
                 .content
                 .with_untracked(|content| !content.is_local()),
             Condition::SearchFocus => {
@@ -2526,7 +2808,7 @@ impl KeyPressFocus for EditorData {
             }
             Condition::SearchActive => {
                 if self.common.config.get_untracked().core.modal
-                    && self.cursor.with_untracked(|c| !c.is_normal())
+                    && self.cursor().with_untracked(|c| !c.is_normal())
                 {
                     false
                 } else {
@@ -2541,8 +2823,8 @@ impl KeyPressFocus for EditorData {
         &self,
         command: &crate::command::LapceCommand,
         count: Option<usize>,
-        mods: ModifiersState,
-    ) -> crate::command::CommandExecuted {
+        mods: Modifiers,
+    ) -> CommandExecuted {
         if self.common.find.visual.get_untracked() && self.find_focus.get_untracked()
         {
             match &command.kind {
@@ -2579,11 +2861,19 @@ impl KeyPressFocus for EditorData {
                 let movement = cmd.to_movement(count);
                 self.run_move_command(&movement, count, mods)
             }
+            crate::command::CommandKind::Scroll(cmd) => {
+                if self
+                    .doc()
+                    .content
+                    .with_untracked(|content| content.is_local())
+                {
+                    return CommandExecuted::No;
+                }
+                self.run_scroll_command(cmd, count, mods)
+            }
             crate::command::CommandKind::Focus(cmd) => {
                 if self
-                    .view
-                    .doc
-                    .get_untracked()
+                    .doc()
                     .content
                     .with_untracked(|content| content.is_local())
                 {
@@ -2625,9 +2915,13 @@ impl KeyPressFocus for EditorData {
         } else {
             // normal editor receive char
             if self.get_mode() == Mode::Insert {
-                let mut cursor = self.cursor.get_untracked();
-                let deltas = self.view.doc.get_untracked().do_insert(&mut cursor, c);
-                self.cursor.set(cursor);
+                let mut cursor = self.cursor().get_untracked();
+                let deltas = self.doc().do_insert(
+                    &mut cursor,
+                    c,
+                    &self.common.config.get_untracked(),
+                );
+                self.cursor().set(cursor);
 
                 if !c
                     .chars()
@@ -2652,12 +2946,53 @@ impl KeyPressFocus for EditorData {
     }
 }
 
+/// Custom signal wrapper for [`Doc`], because [`Editor`] only knows it as a
+/// `Rc<dyn Document>`, and there is currently no way to have an `RwSignal<Rc<Doc>>` and
+/// an `RwSignal<Rc<dyn Document>>`.  
+/// This could possibly be swapped with a generic impl?
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DocSignal {
+    // TODO: replace with ReadSignal once that impls `track`
+    inner: RwSignal<Rc<dyn Document>>,
+}
+impl DocSignal {
+    pub fn get(&self) -> Rc<Doc> {
+        let doc = self.inner.get();
+        doc.downcast_rc().ok().expect("doc is not Rc<Doc>")
+    }
+
+    pub fn get_untracked(&self) -> Rc<Doc> {
+        let doc = self.inner.get_untracked();
+        doc.downcast_rc().ok().expect("doc is not Rc<Doc>")
+    }
+
+    pub fn with<O>(&self, f: impl FnOnce(&Rc<Doc>) -> O) -> O {
+        self.inner.with(|doc| {
+            let doc = doc.clone();
+            let doc: Rc<Doc> = doc.downcast_rc().ok().expect("doc is not Rc<Doc>");
+            f(&doc)
+        })
+    }
+
+    pub fn with_untracked<O>(&self, f: impl FnOnce(&Rc<Doc>) -> O) -> O {
+        self.inner.with_untracked(|doc| {
+            let doc = doc.clone();
+            let doc: Rc<Doc> = doc.downcast_rc().ok().expect("doc is not Rc<Doc>");
+            f(&doc)
+        })
+    }
+
+    pub fn track(&self) {
+        self.inner.track();
+    }
+}
+
 /// Checks if completion should be triggered if the received command
 /// is one that inserts whitespace or deletes whitespace
 fn show_completion(
     cmd: &EditCommand,
     doc: &Rope,
-    deltas: &[(RopeDelta, InvalLines, SyntaxEdit)],
+    deltas: &[(Rope, RopeDelta, InvalLines)],
 ) -> bool {
     let show_completion = match cmd {
         EditCommand::DeleteBackward
@@ -2665,12 +3000,12 @@ fn show_completion(
         | EditCommand::DeleteWordBackward
         | EditCommand::DeleteWordForward
         | EditCommand::DeleteForwardAndInsert => {
-            let start = match deltas.first().and_then(|delta| delta.0.els.first()) {
+            let start = match deltas.first().and_then(|delta| delta.1.els.first()) {
                 Some(lapce_xi_rope::DeltaElement::Copy(_, start)) => *start,
                 _ => 0,
             };
 
-            let end = match deltas.first().and_then(|delta| delta.0.els.get(1)) {
+            let end = match deltas.first().and_then(|delta| delta.1.els.get(1)) {
                 Some(lapce_xi_rope::DeltaElement::Copy(end, _)) => *end,
                 _ => 0,
             };
@@ -2703,13 +3038,14 @@ fn show_inline_completion(cmd: &EditCommand) -> bool {
 }
 
 // TODO(minor): Should we just put this on view, since it only requires those values?
-fn compute_screen_lines(
+pub(crate) fn compute_screen_lines(
     config: ReadSignal<Arc<LapceConfig>>,
     base: RwSignal<ScreenLinesBase>,
     view_kind: ReadSignal<EditorViewKind>,
-    doc: ReadSignal<Rc<Document>>,
+    doc: &Doc,
     lines: &Lines,
     text_prov: impl TextLayoutProvider + Clone,
+    config_id: ConfigId,
 ) -> ScreenLines {
     // TODO: this should probably be a get since we need to depend on line-height
     let config = config.get();
@@ -2721,25 +3057,16 @@ fn compute_screen_lines(
     let min_vline = VLine((y0 / line_height as f64).floor() as usize);
     let max_vline = VLine((y1 / line_height as f64).ceil() as usize);
 
-    let (cache_rev, content, loaded) =
-        doc.with(|doc| (doc.cache_rev, doc.content, doc.loaded));
-
-    cache_rev.track();
+    let cache_rev = doc.cache_rev.get();
+    lines.check_cache_rev(cache_rev);
     // TODO(minor): we don't really need to depend on various subdetails that aren't affecting how
     // the screen lines are set up, like the title of a scratch document.
-    content.track();
-    loaded.track();
+    doc.content.track();
+    doc.loaded.track();
 
     let min_info = once_cell::sync::Lazy::new(|| {
         lines
             .iter_vlines(text_prov.clone(), false, min_vline)
-            .next()
-    });
-    // TODO: if you need the max vline you probably need the min vline too and so you could grab
-    // both in one iter call, which would be more efficient than two iterations
-    let max_info = once_cell::sync::Lazy::new(|| {
-        lines
-            .iter_vlines(text_prov.clone(), false, max_vline)
             .next()
     });
 
@@ -2761,7 +3088,13 @@ fn compute_screen_lines(
             // the iterator is from min_vline..max_vline
             let count = max_vline.get() - min_vline.get();
             let iter = lines
-                .iter_rvlines_init(text_prov, config.id, min_info.rvline, false)
+                .iter_rvlines_init(
+                    text_prov,
+                    cache_rev,
+                    config_id,
+                    min_info.rvline,
+                    false,
+                )
                 .take(count);
 
             for (i, vline_info) in iter.enumerate() {
@@ -2873,30 +3206,26 @@ fn compute_screen_lines(
                             continue;
                         }
 
-                        let Some(min_info) = *min_info else {
-                            // TODO(minor): What is the proper behavior here?
-                            break;
-                        };
-
-                        let Some(max_info) = *max_info else {
-                            // TODO(minor): What is the proper behavior here?
-                            break;
-                        };
-
                         let start_rvline =
                             lines.rvline_of_line(&text_prov, range.start);
 
                         // TODO: this wouldn't need to produce vlines if screen lines didn't
                         // require them.
                         let iter = lines
-                            .iter_rvlines(&text_prov, false, start_rvline)
+                            .iter_rvlines_init(
+                                &text_prov,
+                                cache_rev,
+                                config_id,
+                                start_rvline,
+                                false,
+                            )
                             .take_while(|vline_info| {
                                 vline_info.rvline.line < range.end
                             })
                             .enumerate();
                         for (i, rvline_info) in iter {
                             let rvline = rvline_info.rvline;
-                            if rvline < min_info.rvline {
+                            if initial_y_idx + i < min_vline.0 {
                                 continue;
                             }
 
@@ -2911,7 +3240,7 @@ fn compute_screen_lines(
                                 },
                             );
 
-                            if rvline > max_info.rvline {
+                            if initial_y_idx + i > max_vline.0 {
                                 break;
                             }
                         }
@@ -2955,7 +3284,8 @@ fn compute_screen_lines(
                         let mut iter = lines
                             .iter_rvlines_init(
                                 &text_prov,
-                                config.id,
+                                cache_rev,
+                                config_id,
                                 start_rvline,
                                 false,
                             )
@@ -2967,9 +3297,10 @@ fn compute_screen_lines(
                             if let Some(skip) = bothinfo.skip.as_ref() {
                                 if Some(skip.start) == line.checked_sub(start) {
                                     y_idx += 1;
-                                    // Skip by `skip` count, which is skip - 1 because we will
-                                    // go to the next vline on the next iter
-                                    let _ = iter.nth(skip.len().saturating_sub(1));
+                                    // Skip by `skip` count
+                                    for _ in 0..skip.len().saturating_sub(1) {
+                                        iter.next();
+                                    }
                                     continue;
                                 }
                             }
@@ -3021,20 +3352,16 @@ fn parse_hover_resp(
                 config,
             ),
         },
-        HoverContents::Array(array) => {
-            let entries = array
-                .into_iter()
-                .map(|t| from_marked_string(t, config))
-                .rev();
-
-            // TODO: It'd be nice to avoid this vec
-            itertools::Itertools::intersperse(
-                entries,
-                vec![MarkdownContent::Separator],
-            )
-            .flatten()
-            .collect()
-        }
+        HoverContents::Array(array) => array
+            .into_iter()
+            .map(|t| from_marked_string(t, config))
+            .rev()
+            .reduce(|mut contents, more| {
+                contents.push(MarkdownContent::Separator);
+                contents.extend(more);
+                contents
+            })
+            .unwrap_or_default(),
         HoverContents::Markup(content) => match content.kind {
             MarkupKind::PlainText => from_plaintext(&content.value, 1.5, config),
             MarkupKind::Markdown => parse_markdown(&content.value, 1.5, config),

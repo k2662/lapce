@@ -2,11 +2,11 @@ use std::rc::Rc;
 
 use floem::{
     event::EventListener,
-    keyboard::ModifiersState,
+    keyboard::Modifiers,
     reactive::{RwSignal, Scope},
     style::{CursorStyle, Display, Position},
-    view::View,
     views::{container, label, stack, svg, Decorators},
+    View,
 };
 use lapce_core::{command::FocusCommand, meta::VERSION, mode::Mode};
 
@@ -68,12 +68,13 @@ impl KeyPressFocus for AboutData {
         &self,
         command: &crate::command::LapceCommand,
         _count: Option<usize>,
-        _mods: ModifiersState,
+        _mods: Modifiers,
     ) -> crate::command::CommandExecuted {
         match &command.kind {
             CommandKind::Workbench(_) => {}
             CommandKind::Edit(_) => {}
             CommandKind::Move(_) => {}
+            CommandKind::Scroll(_) => {}
             CommandKind::Focus(cmd) => {
                 if cmd == &FocusCommand::ModalClose {
                     self.close();

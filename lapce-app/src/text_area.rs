@@ -2,8 +2,8 @@ use floem::{
     cosmic_text::{Attrs, AttrsList, LineHeightValue, TextLayout},
     peniko::kurbo::Rect,
     reactive::{create_effect, create_rw_signal},
-    view::View,
     views::{container, label, rich_text, scroll, stack, Decorators},
+    View,
 };
 use lapce_core::buffer::rope_text::RopeText;
 
@@ -14,8 +14,8 @@ pub fn text_area(
     is_active: impl Fn() -> bool + 'static,
 ) -> impl View {
     let config = editor.common.config;
-    let doc = editor.view.doc;
-    let cursor = editor.cursor;
+    let doc = editor.doc_signal();
+    let cursor = editor.cursor();
     let text_area_rect = create_rw_signal(Rect::ZERO);
     let text_layout = create_rw_signal(TextLayout::new());
     let line_height = 1.2;

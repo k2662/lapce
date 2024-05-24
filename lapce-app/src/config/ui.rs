@@ -33,8 +33,8 @@ pub struct UIConfig {
     #[field_names(desc = "Controls the width of drop shadow in the UI")]
     drop_shadow_width: usize,
 
-    #[field_names(desc = "Controls the width of the preview editor")]
-    preview_editor_width: usize,
+    #[field_names(desc = "Controls the width of the command palette")]
+    palette_width: usize,
 
     #[field_names(
         desc = "Set the hover font family. If empty, it uses the UI font family"
@@ -51,6 +51,9 @@ pub struct UIConfig {
 
     #[field_names(desc = "Set position of the close button in editor tabs")]
     pub tab_close_button: TabCloseButton,
+
+    #[field_names(desc = "Display the Open Editors section in the explorer")]
+    pub open_editors_visible: bool,
 }
 
 #[derive(
@@ -64,7 +67,7 @@ pub struct UIConfig {
     Eq,
     PartialOrd,
     Ord,
-    strum_macros::EnumVariantNames,
+    strum_macros::VariantNames,
 )]
 pub enum TabCloseButton {
     Left,
@@ -98,5 +101,13 @@ impl UIConfig {
     pub fn status_height(&self) -> usize {
         let font_size = self.font_size();
         self.status_height.max(font_size)
+    }
+
+    pub fn palette_width(&self) -> usize {
+        if self.palette_width == 0 {
+            500
+        } else {
+            self.palette_width.max(100)
+        }
     }
 }

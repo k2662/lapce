@@ -2,14 +2,14 @@ use std::{path::PathBuf, rc::Rc, sync::Arc};
 
 use floem::{
     peniko::Color,
-    reactive::{create_memo, create_rw_signal, ReadSignal},
+    reactive::{create_effect, create_rw_signal, ReadSignal},
     style::{CursorStyle, Style},
-    view::View,
     views::{container, dyn_stack, label, scroll, stack, svg, Decorators},
+    View,
 };
 use lsp_types::{DiagnosticRelatedInformation, DiagnosticSeverity};
 
-use super::{position::PanelPosition, view::panel_header};
+use super::{data::PanelSection, position::PanelPosition, view::PanelBuilder};
 use crate::{
     command::InternalCommand,
     config::{color::LapceColor, icon::LapceIcons, LapceConfig},
@@ -27,30 +27,23 @@ pub fn problem_panel(
 ) -> impl View {
     let config = window_tab_data.common.config;
     let is_bottom = position.is_bottom();
-    stack((
-        stack((
-            panel_header("Errors".to_string(), config),
+    PanelBuilder::new(config, position)
+        .add_style(
+            "Errors",
             problem_section(window_tab_data.clone(), DiagnosticSeverity::ERROR),
-        ))
-        .style(move |s| {
-            let config = config.get();
-            s.flex_col()
-                .flex_basis(0.0)
-                .flex_grow(1.0)
-                .border_color(config.color(LapceColor::LAPCE_BORDER))
-                .apply_if(is_bottom, |s| s.border_right(1.0))
-                .apply_if(!is_bottom, |s| s.border_bottom(1.0))
-        }),
-        stack((
-            panel_header("Warnings".to_string(), config),
-            problem_section(window_tab_data, DiagnosticSeverity::WARNING),
-        ))
-        .style(|s| s.flex_col().flex_basis(0.0).flex_grow(1.0)),
-    ))
-    .style(move |s| {
-        s.size_pct(100.0, 100.0)
-            .apply_if(!is_bottom, |s| s.flex_col())
-    })
+            window_tab_data.panel.section_open(PanelSection::Error),
+            move |s| {
+                s.border_color(config.get().color(LapceColor::LAPCE_BORDER))
+                    .apply_if(is_bottom, |s| s.border_right(1.0))
+                    .apply_if(!is_bottom, |s| s.border_bottom(1.0))
+            },
+        )
+        .add(
+            "Warnings",
+            problem_section(window_tab_data.clone(), DiagnosticSeverity::WARNING),
+            window_tab_data.panel.section_open(PanelSection::Warn),
+        )
+        .build()
 }
 
 fn problem_section(
@@ -93,19 +86,40 @@ fn file_view(
 ) -> impl View {
     let collpased = create_rw_signal(false);
 
-    let diagnostics = create_memo(move |_| {
-        let diagnostics = diagnostic_data.diagnostics.get();
-        let diagnostics: im::Vector<EditorDiagnostic> = diagnostics
-            .into_iter()
-            .filter_map(|d| {
-                if d.diagnostic.severity == Some(severity) {
-                    Some(d)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        diagnostics
+    let diagnostics = create_rw_signal(im::Vector::new());
+    create_effect(move |_| {
+        let span = diagnostic_data.diagnostics_span.get();
+        let d = if !span.is_empty() {
+            span.iter()
+                .filter_map(|(iv, diag)| {
+                    if diag.severity == Some(severity) {
+                        Some(EditorDiagnostic {
+                            range: Some((iv.start, iv.end)),
+                            diagnostic: diag.to_owned(),
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect::<im::Vector<EditorDiagnostic>>()
+        } else {
+            let diagnostics = diagnostic_data.diagnostics.get();
+            let diagnostics: im::Vector<EditorDiagnostic> = diagnostics
+                .into_iter()
+                .filter_map(|d| {
+                    if d.severity == Some(severity) {
+                        Some(EditorDiagnostic {
+                            range: None,
+                            diagnostic: d,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            diagnostics
+        };
+        diagnostics.set(d);
     });
 
     let full_path = path.clone();
@@ -208,7 +222,7 @@ fn file_view(
                     diagnostics.get()
                 }
             },
-            |_| 0,
+            |d| (d.range, d.diagnostic.range),
             move |d| {
                 item_view(
                     full_path.clone(),
@@ -239,9 +253,14 @@ fn item_view(
     config: ReadSignal<Arc<LapceConfig>>,
 ) -> impl View {
     let related = d.diagnostic.related_information.unwrap_or_default();
+    let position = if let Some((start, _)) = d.range {
+        EditorPosition::Offset(start)
+    } else {
+        EditorPosition::Position(d.diagnostic.range.start)
+    };
     let location = EditorLocation {
         path,
-        position: Some(EditorPosition::Position(d.diagnostic.range.start)),
+        position: Some(position),
         scroll_offset: None,
         ignore_unconfirmed: false,
         same_editor_tab: false,

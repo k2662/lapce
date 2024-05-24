@@ -14,11 +14,11 @@
   <a href="https://discord.gg/n8tGJ6Rn6D" target="_blank">
     <img src="https://img.shields.io/discord/946858761413328946?logo=discord" />
   </a>
-  <a href="https://matrix.to/#/#lapce-editor:matrix.org" target="_blank">
-    <img src="https://img.shields.io/matrix/lapce-editor:matrix.org?color=turquoise&logo=Matrix" />
-  </a>
   <a href="https://docs.lapce.dev" target="_blank">
       <img src="https://img.shields.io/static/v1?label=Docs&message=docs.lapce.dev&color=blue" alt="Lapce Docs">
+  </a>
+  <a href="https://wiki.mutable.ai/lapce/lapce" target="_blank">
+      <img src="https://img.shields.io/static/v1?label=Code Wiki&message=Mutable.ai&color=blue" alt="Mutable.ai Auto Wiki">
   </a>
 </div>
 <br/>
@@ -32,7 +32,7 @@ Lapce (IPA: /læps/) is written in pure Rust with a UI in [Floem](https://github
 
 * Built-in LSP ([Language Server Protocol](https://microsoft.github.io/language-server-protocol/)) support to give you intelligent code features such as: completion, diagnostics and code actions
 * Modal editing support as first class citizen (Vim-like, and toggleable)
-* Built-in remote development support inspired by [VSCode Remote Development](https://code.visualstudio.com/docs/remote/remote-overview). Enjoy the benefits of a "local" experience, and seamlessly gain the full power of a remote system.
+* Built-in remote development support inspired by [VSCode Remote Development](https://code.visualstudio.com/docs/remote/remote-overview). Enjoy the benefits of a "local" experience, and seamlessly gain the full power of a remote system. We also have [lapdev](https://github.com/lapce/lapdev) which can help manage your remote dev environments. 
 * Plugins can be written in programming languages that can compile to the [WASI](https://wasi.dev/) format (C, Rust, [AssemblyScript](https://www.assemblyscript.org/))
 * Built-in terminal, so you can execute commands in your workspace, without leaving Lapce.
 

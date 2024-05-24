@@ -6,14 +6,14 @@ use floem::{
     peniko::Color,
     reactive::{create_memo, Memo, ReadSignal, RwSignal},
     style::{AlignItems, CursorStyle, JustifyContent},
-    view::View,
     views::{container, drag_window_area, empty, label, stack, svg, Decorators},
+    View,
 };
 use lapce_core::meta;
 use lapce_rpc::proxy::ProxyStatus;
 
 use crate::{
-    app::{clickable_icon, window_menu},
+    app::{clickable_icon, not_clickable_icon, tooltip_label, window_menu},
     command::{LapceCommand, LapceWorkbenchCommand, WindowCommand},
     config::{color::LapceColor, icon::LapceIcons, LapceConfig},
     listener::Listener,
@@ -50,27 +50,37 @@ fn left(
             },
         ))
         .style(move |s| s.margin_horiz(10.0).apply_if(is_macos, |s| s.hide())),
-        clickable_icon(|| LapceIcons::MENU, move || {}, || false, || false, config)
-            .popout_menu(move || window_menu(lapce_command, workbench_command))
-            .style(move |s| {
-                s.margin_left(4.0)
-                    .margin_right(6.0)
-                    .apply_if(is_macos, |s| s.hide())
-            }),
-        container(svg(move || config.get().ui_svg(LapceIcons::REMOTE)).style(
-            move |s| {
-                let config = config.get();
-                let size = (config.ui.icon_size() as f32 + 2.0).min(30.0);
-                s.size(size, size).color(if is_local {
-                    config.color(LapceColor::LAPCE_ICON_ACTIVE)
-                } else {
-                    match proxy_status.get() {
-                        Some(_) => Color::WHITE,
-                        None => config.color(LapceColor::LAPCE_ICON_ACTIVE),
-                    }
-                })
-            },
-        ))
+        not_clickable_icon(
+            || LapceIcons::MENU,
+            || false,
+            || false,
+            || "Menu",
+            config,
+        )
+        .popout_menu(move || window_menu(lapce_command, workbench_command))
+        .style(move |s| {
+            s.margin_left(4.0)
+                .margin_right(6.0)
+                .apply_if(is_macos, |s| s.hide())
+        }),
+        tooltip_label(
+            config,
+            container(svg(move || config.get().ui_svg(LapceIcons::REMOTE)).style(
+                move |s| {
+                    let config = config.get();
+                    let size = (config.ui.icon_size() as f32 + 2.0).min(30.0);
+                    s.size(size, size).color(if is_local {
+                        config.color(LapceColor::LAPCE_ICON_ACTIVE)
+                    } else {
+                        match proxy_status.get() {
+                            Some(_) => Color::WHITE,
+                            None => config.color(LapceColor::LAPCE_ICON_ACTIVE),
+                        }
+                    })
+                },
+            )),
+            || "Connect to Remote",
+        )
         .popout_menu(move || {
             #[allow(unused_mut)]
             let mut menu = Menu::new("").entry(
@@ -78,6 +88,18 @@ fn left(
                     workbench_command.send(LapceWorkbenchCommand::ConnectSshHost);
                 }),
             );
+            if !is_local
+                && proxy_status.get().is_some_and(|p| {
+                    matches!(p, ProxyStatus::Connecting | ProxyStatus::Connected)
+                })
+            {
+                menu = menu.entry(MenuItem::new("Disconnect remote").action(
+                    move || {
+                        workbench_command
+                            .send(LapceWorkbenchCommand::DisconnectRemote);
+                    },
+                ));
+            }
             #[cfg(windows)]
             {
                 menu = menu.entry(MenuItem::new("Connect to WSL Host").action(
@@ -155,6 +177,7 @@ fn middle(
             },
             || false,
             move || !can_jump_backward.get(),
+            || "Jump Backward",
             config,
         )
         .style(move |s| s.margin_horiz(6.0))
@@ -167,17 +190,18 @@ fn middle(
             },
             || false,
             move || !can_jump_forward.get(),
+            || "Jump Forward",
             config,
         )
         .style(move |s| s.margin_right(6.0))
     };
 
     let open_folder = move || {
-        clickable_icon(
+        not_clickable_icon(
             || LapceIcons::PALETTE_MENU,
-            move || {},
             || false,
             || false,
+            || "Open Folder / Recent Workspace",
             config,
         )
         .popout_menu(move || {
@@ -255,6 +279,7 @@ fn middle(
                 },
                 || false,
                 || false,
+                || "Run and Debug",
                 config,
             )
             .style(move |s| s.margin_horiz(6.0)),
@@ -303,11 +328,11 @@ fn right(
         drag_window_area(empty())
             .style(|s| s.height_pct(100.0).flex_basis(0.0).flex_grow(1.0)),
         stack((
-            clickable_icon(
+            not_clickable_icon(
                 || LapceIcons::SETTINGS,
-                || {},
                 || false,
                 || false,
+                || "Settings",
                 config,
             )
             .popout_menu(move || {
@@ -455,6 +480,7 @@ pub fn window_controls_view(
             },
             || false,
             || false,
+            || "Minimize",
             config,
         )
         .style(|s| s.margin_right(16.0).margin_left(10.0)),
@@ -473,6 +499,7 @@ pub fn window_controls_view(
             },
             || false,
             || false,
+            || "Maximize",
             config,
         )
         .style(|s| s.margin_right(16.0)),
@@ -483,6 +510,7 @@ pub fn window_controls_view(
             },
             || false,
             || false,
+            || "Close Window",
             config,
         )
         .style(|s| s.margin_right(6.0)),

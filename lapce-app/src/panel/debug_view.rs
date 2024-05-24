@@ -6,18 +6,18 @@ use floem::{
     peniko::Color,
     reactive::{create_rw_signal, ReadSignal, RwSignal},
     style::CursorStyle,
-    view::View,
     views::{
-        container, container_box, dyn_stack, label, scroll, stack, svg, text,
-        virtual_stack, Decorators, VirtualDirection, VirtualItemSize,
+        container, dyn_stack, label, scroll, stack, svg, text, virtual_stack,
+        Decorators, VirtualDirection, VirtualItemSize,
     },
+    View,
 };
 use lapce_rpc::{
     dap_types::{DapId, ThreadId},
     terminal::TermId,
 };
 
-use super::{position::PanelPosition, view::panel_header};
+use super::{data::PanelSection, position::PanelPosition, view::PanelBuilder};
 use crate::{
     app::clickable_icon,
     command::InternalCommand,
@@ -38,35 +38,30 @@ pub fn debug_panel(
     let terminal = window_tab_data.terminal.clone();
     let internal_command = window_tab_data.common.internal_command;
 
-    stack((
-        {
-            let terminal = terminal.clone();
-            stack((
-                panel_header("Processes".to_string(), config),
-                debug_processes(terminal, config),
-            ))
-            .style(|s| s.width_pct(100.0).flex_col().height(150.0))
-        },
-        stack((
-            panel_header("Variables".to_string(), config),
+    PanelBuilder::new(config, position)
+        .add_height(
+            "Processes",
+            150.0,
+            debug_processes(terminal.clone(), config),
+            window_tab_data.panel.section_open(PanelSection::Process),
+        )
+        .add(
+            "Variables",
             variables_view(window_tab_data.clone()),
-        ))
-        .style(|s| s.width_pct(100.0).flex_grow(1.0).flex_basis(0.0).flex_col()),
-        stack((
-            panel_header("Stack Frames".to_string(), config),
-            debug_stack_traces(terminal, internal_command, config),
-        ))
-        .style(|s| s.width_pct(100.0).flex_grow(1.0).flex_basis(0.0).flex_col()),
-        stack((
-            panel_header("Breakpoints".to_string(), config),
+            window_tab_data.panel.section_open(PanelSection::Variable),
+        )
+        .add(
+            "Stack Frames",
+            debug_stack_traces(terminal.clone(), internal_command, config),
+            window_tab_data.panel.section_open(PanelSection::StackFrame),
+        )
+        .add_height(
+            "Breakpoints",
+            150.0,
             breakpoints_view(window_tab_data.clone()),
-        ))
-        .style(|s| s.width_pct(100.0).flex_col().height(150.0)),
-    ))
-    .style(move |s| {
-        s.width_pct(100.0)
-            .apply_if(!position.is_bottom(), |s| s.flex_col())
-    })
+            window_tab_data.panel.section_open(PanelSection::Breakpoint),
+        )
+        .build()
 }
 
 fn debug_process_icons(
@@ -85,7 +80,7 @@ fn debug_process_icons(
         stopped.map(|stopped| stopped.get()).unwrap_or(false)
     };
     match mode {
-        RunDebugMode::Run => container_box(stack((
+        RunDebugMode::Run => container(stack((
             {
                 let terminal = terminal.clone();
                 clickable_icon(
@@ -95,6 +90,7 @@ fn debug_process_icons(
                     },
                     || false,
                     || false,
+                    || "Restart",
                     config,
                 )
                 .style(|s| s.margin_horiz(4.0))
@@ -108,6 +104,7 @@ fn debug_process_icons(
                     },
                     || false,
                     move || stopped,
+                    || "Stop",
                     config,
                 )
                 .style(|s| s.margin_right(4.0))
@@ -121,12 +118,13 @@ fn debug_process_icons(
                     },
                     || false,
                     || false,
+                    || "Close",
                     config,
                 )
                 .style(|s| s.margin_right(4.0))
             },
         ))),
-        RunDebugMode::Debug => container_box(stack((
+        RunDebugMode::Debug => container(stack((
             {
                 let terminal = terminal.clone();
                 clickable_icon(
@@ -136,6 +134,7 @@ fn debug_process_icons(
                     },
                     || false,
                     move || !paused() || stopped,
+                    || "Continue",
                     config,
                 )
                 .style(|s| s.margin_horiz(6.0))
@@ -149,6 +148,7 @@ fn debug_process_icons(
                     },
                     || false,
                     move || paused() || stopped,
+                    || "Pause",
                     config,
                 )
                 .style(|s| s.margin_right(4.0))
@@ -162,6 +162,7 @@ fn debug_process_icons(
                     },
                     || false,
                     move || !paused() || stopped,
+                    || "Step Over",
                     config,
                 )
                 .style(|s| s.margin_right(4.0))
@@ -175,6 +176,7 @@ fn debug_process_icons(
                     },
                     || false,
                     move || !paused() || stopped,
+                    || "Step Into",
                     config,
                 )
                 .style(|s| s.margin_right(4.0))
@@ -188,6 +190,7 @@ fn debug_process_icons(
                     },
                     || false,
                     move || !paused() || stopped,
+                    || "Step Out",
                     config,
                 )
                 .style(|s| s.margin_right(4.0))
@@ -201,6 +204,7 @@ fn debug_process_icons(
                     },
                     || false,
                     || false,
+                    || "Restart",
                     config,
                 )
                 .style(|s| s.margin_right(4.0))
@@ -214,6 +218,7 @@ fn debug_process_icons(
                     },
                     || false,
                     move || stopped,
+                    || "Stop",
                     config,
                 )
                 .style(|s| s.margin_right(4.0))
@@ -227,6 +232,7 @@ fn debug_process_icons(
                     },
                     || false,
                     || false,
+                    || "Close",
                     config,
                 )
                 .style(|s| s.margin_right(4.0))
@@ -668,6 +674,7 @@ fn breakpoints_view(window_tab_data: Rc<WindowTabData>) -> impl View {
                             },
                             || false,
                             || false,
+                            || "Remove",
                             config,
                         )
                         .on_event_stop(EventListener::PointerDown, |_| {}),

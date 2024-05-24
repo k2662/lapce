@@ -1,7 +1,7 @@
 use std::{rc::Rc, sync::Arc};
 
 use floem::{
-    keyboard::ModifiersState,
+    keyboard::Modifiers,
     peniko::kurbo::Rect,
     reactive::{RwSignal, Scope},
 };
@@ -65,12 +65,13 @@ impl KeyPressFocus for CodeActionData {
         &self,
         command: &crate::command::LapceCommand,
         _count: Option<usize>,
-        _mods: ModifiersState,
+        _mods: Modifiers,
     ) -> crate::command::CommandExecuted {
         match &command.kind {
             CommandKind::Workbench(_) => {}
             CommandKind::Edit(_) => {}
             CommandKind::Move(_) => {}
+            CommandKind::Scroll(_) => {}
             CommandKind::Focus(cmd) => {
                 self.run_focus_command(cmd);
             }
@@ -193,7 +194,7 @@ impl CodeActionData {
         self.common.focus.set(Focus::Workbench);
     }
 
-    fn select(&self) {
+    pub fn select(&self) {
         if let Some(item) = self.filtered_items.get(self.active.get_untracked()) {
             self.common
                 .internal_command

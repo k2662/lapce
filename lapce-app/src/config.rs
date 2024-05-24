@@ -15,6 +15,7 @@ use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use serde::Deserialize;
 use strum::VariantNames;
+use tracing::error;
 
 use self::{
     color::LapceColor,
@@ -50,6 +51,38 @@ static DEFAULT_CONFIG: Lazy<config::Config> = Lazy::new(LapceConfig::default_con
 static DEFAULT_LAPCE_CONFIG: Lazy<LapceConfig> =
     Lazy::new(LapceConfig::default_lapce_config);
 
+static DEFAULT_DARK_THEME_CONFIG: Lazy<config::Config> = Lazy::new(|| {
+    config::Config::builder()
+        .add_source(config::File::from_str(
+            DEFAULT_DARK_THEME,
+            config::FileFormat::Toml,
+        ))
+        .build()
+        .unwrap()
+});
+
+/// The default theme is the dark theme.
+static DEFAULT_DARK_THEME_COLOR_CONFIG: Lazy<ColorThemeConfig> = Lazy::new(|| {
+    let (_, theme) =
+        LapceConfig::load_color_theme_from_str(DEFAULT_DARK_THEME).unwrap();
+    theme.get::<ColorThemeConfig>("color-theme")
+    .expect("Failed to load default dark theme. This is likely due to a missing or misnamed field in dark-theme.toml")
+});
+
+static DEFAULT_ICON_THEME_CONFIG: Lazy<config::Config> = Lazy::new(|| {
+    config::Config::builder()
+        .add_source(config::File::from_str(
+            DEFAULT_ICON_THEME,
+            config::FileFormat::Toml,
+        ))
+        .build()
+        .unwrap()
+});
+static DEFAULT_ICON_THEME_ICON_CONFIG: Lazy<IconThemeConfig> = Lazy::new(|| {
+    DEFAULT_ICON_THEME_CONFIG.get::<IconThemeConfig>("icon-theme")
+    .expect("Failed to load default icon theme. This is likely due to a missing or misnamed field in icon-theme.toml")
+});
+
 /// Used for creating a `DropdownData` for a setting
 #[derive(Debug, Clone)]
 pub struct DropdownInfo {
@@ -58,7 +91,7 @@ pub struct DropdownInfo {
     pub items: im::Vector<String>,
 }
 
-#[derive(Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct LapceConfig {
     #[serde(skip)]
@@ -67,14 +100,12 @@ pub struct LapceConfig {
     pub ui: UIConfig,
     pub editor: EditorConfig,
     pub terminal: TerminalConfig,
+    #[serde(default)]
     pub color_theme: ColorThemeConfig,
+    #[serde(default)]
     pub icon_theme: IconThemeConfig,
     #[serde(flatten)]
     pub plugins: HashMap<String, HashMap<String, serde_json::Value>>,
-    #[serde(skip)]
-    pub default_color_theme: ColorThemeConfig,
-    #[serde(skip)]
-    pub default_icon_theme: IconThemeConfig,
     #[serde(skip)]
     pub color: ThemeColor,
     #[serde(skip)]
@@ -98,15 +129,24 @@ pub struct LapceConfig {
 }
 
 impl LapceConfig {
-    pub fn load(workspace: &LapceWorkspace, disabled_volts: &[VoltID]) -> Self {
+    pub fn load(
+        workspace: &LapceWorkspace,
+        disabled_volts: &[VoltID],
+        extra_plugin_paths: &[PathBuf],
+    ) -> Self {
         let config = Self::merge_config(workspace, None, None);
-        let mut lapce_config: LapceConfig = config
-            .try_deserialize()
-            .unwrap_or_else(|_| DEFAULT_LAPCE_CONFIG.clone());
+        let mut lapce_config: LapceConfig = match config.try_deserialize() {
+            Ok(config) => config,
+            Err(error) => {
+                error!("Failed to deserialize configuration file: {error}");
+                DEFAULT_LAPCE_CONFIG.clone()
+            }
+        };
 
         lapce_config.available_color_themes =
-            Self::load_color_themes(disabled_volts);
-        lapce_config.available_icon_themes = Self::load_icon_themes(disabled_volts);
+            Self::load_color_themes(disabled_volts, extra_plugin_paths);
+        lapce_config.available_icon_themes =
+            Self::load_icon_themes(disabled_volts, extra_plugin_paths);
         lapce_config.resolve_theme(workspace);
 
         lapce_config.color_theme_list = lapce_config
@@ -143,9 +183,13 @@ impl LapceConfig {
         icon_theme_config: Option<config::Config>,
     ) -> config::Config {
         let mut config = DEFAULT_CONFIG.clone();
+
         if let Some(theme) = color_theme_config {
+            // TODO: use different color theme basis if the theme declares its color preference
+            // differently
             config = config::Config::builder()
                 .add_source(config.clone())
+                .add_source(DEFAULT_DARK_THEME_CONFIG.clone())
                 .add_source(theme)
                 .build()
                 .unwrap_or_else(|_| config.clone());
@@ -207,78 +251,66 @@ impl LapceConfig {
 
     fn default_lapce_config() -> LapceConfig {
         let mut default_lapce_config: LapceConfig =
-            DEFAULT_CONFIG.clone().try_deserialize().unwrap();
+            DEFAULT_CONFIG.clone().try_deserialize().expect("Failed to deserialize default config, this likely indicates a missing or misnamed field in settings.toml");
+        default_lapce_config.color_theme = DEFAULT_DARK_THEME_COLOR_CONFIG.clone();
+        default_lapce_config.icon_theme = DEFAULT_ICON_THEME_ICON_CONFIG.clone();
         default_lapce_config.resolve_colors(None);
         default_lapce_config
     }
 
     fn resolve_theme(&mut self, workspace: &LapceWorkspace) {
-        let mut default_lapce_config = DEFAULT_LAPCE_CONFIG.clone();
-        if let Some((_, color_theme_config)) = self
-            .available_color_themes
-            .get(&self.core.color_theme.to_lowercase())
-        {
-            if let Ok(mut theme_lapce_config) = config::Config::builder()
-                .add_source(DEFAULT_CONFIG.clone())
-                .add_source(color_theme_config.clone())
-                .build()
-                .and_then(|theme| theme.try_deserialize::<LapceConfig>())
-            {
-                theme_lapce_config.resolve_colors(Some(&default_lapce_config));
-                default_lapce_config = theme_lapce_config;
-            }
-        }
+        let default_lapce_config = DEFAULT_LAPCE_CONFIG.clone();
 
         let color_theme_config = self
             .available_color_themes
             .get(&self.core.color_theme.to_lowercase())
-            .map(|(_, config)| config);
+            .map(|(_, config)| config)
+            .unwrap_or(&DEFAULT_DARK_THEME_CONFIG);
 
         let icon_theme_config = self
             .available_icon_themes
             .get(&self.core.icon_theme.to_lowercase())
-            .map(|(_, config, _)| config);
+            .map(|(_, config, _)| config)
+            .unwrap_or(&DEFAULT_ICON_THEME_CONFIG);
 
         let icon_theme_path = self
             .available_icon_themes
             .get(&self.core.icon_theme.to_lowercase())
             .map(|(_, _, path)| path);
 
-        if color_theme_config.is_some() || icon_theme_config.is_some() {
-            if let Ok(new) = Self::merge_config(
-                workspace,
-                color_theme_config.cloned(),
-                icon_theme_config.cloned(),
-            )
-            .try_deserialize::<LapceConfig>()
-            {
-                self.core = new.core;
-                self.ui = new.ui;
-                self.editor = new.editor;
-                self.terminal = new.terminal;
-                self.terminal.get_indexed_colors();
+        if let Ok(new) = Self::merge_config(
+            workspace,
+            Some(color_theme_config.clone()),
+            Some(icon_theme_config.clone()),
+        )
+        .try_deserialize::<LapceConfig>()
+        {
+            self.core = new.core;
+            self.ui = new.ui;
+            self.editor = new.editor;
+            self.terminal = new.terminal;
+            self.terminal.get_indexed_colors();
 
-                self.color_theme = new.color_theme;
-                self.icon_theme = new.icon_theme;
-                if let Some(icon_theme_path) = icon_theme_path {
-                    self.icon_theme.path =
-                        icon_theme_path.clone().unwrap_or_default();
-                }
-                self.plugins = new.plugins;
+            self.color_theme = new.color_theme;
+            self.icon_theme = new.icon_theme;
+            if let Some(icon_theme_path) = icon_theme_path {
+                self.icon_theme.path = icon_theme_path.clone().unwrap_or_default();
             }
+            self.plugins = new.plugins;
         }
         self.resolve_colors(Some(&default_lapce_config));
-        self.default_color_theme = default_lapce_config.color_theme.clone();
-        self.default_icon_theme = default_lapce_config.icon_theme.clone();
         self.update_id();
     }
 
     fn load_color_themes(
         disabled_volts: &[VoltID],
+        extra_plugin_paths: &[PathBuf],
     ) -> HashMap<String, (String, config::Config)> {
         let mut themes = Self::load_local_themes().unwrap_or_default();
 
-        for (key, theme) in Self::load_plugin_color_themes(disabled_volts) {
+        for (key, theme) in
+            Self::load_plugin_color_themes(disabled_volts, extra_plugin_paths)
+        {
             themes.insert(key, theme);
         }
 
@@ -290,6 +322,10 @@ impl LapceConfig {
         themes.insert(name.to_lowercase(), (name, theme));
 
         themes
+    }
+
+    pub fn default_color_theme(&self) -> &ColorThemeConfig {
+        &DEFAULT_DARK_THEME_COLOR_CONFIG
     }
 
     /// Set the active color theme.
@@ -316,11 +352,13 @@ impl LapceConfig {
     /// If the color was not able to be found in either theme, which may be indicative that
     /// it is misspelled or needs to be added to the base-theme.
     pub fn color(&self, name: &str) -> Color {
-        *self
-            .color
-            .ui
-            .get(name)
-            .unwrap_or_else(|| panic!("Key not found: {name}"))
+        match self.color.ui.get(name) {
+            Some(c) => *c,
+            None => {
+                error!("Failed to find key: {name}");
+                Color::HOT_PINK
+            }
+        }
     }
 
     /// Retrieve a color value whose key starts with "style."
@@ -358,7 +396,7 @@ impl LapceConfig {
         self.color.base = self
             .color_theme
             .base
-            .resolve(default_config.map(|c| &c.color.base));
+            .resolve(default_config.map(|c| &c.color_theme.base));
         self.color.ui = self
             .color_theme
             .resolve_ui_color(&self.color.base, default_config.map(|c| &c.color.ui));
@@ -407,6 +445,8 @@ impl LapceConfig {
         Some((name.to_lowercase(), (name, config)))
     }
 
+    /// Load the given theme by its contents.  
+    /// Returns `(name, theme fields)`
     fn load_color_theme_from_str(s: &str) -> Option<(String, config::Config)> {
         let config = config::Config::builder()
             .add_source(config::File::from_str(s, config::FileFormat::Toml))
@@ -419,11 +459,12 @@ impl LapceConfig {
 
     fn load_icon_themes(
         disabled_volts: &[VoltID],
+        extra_plugin_paths: &[PathBuf],
     ) -> HashMap<String, (String, config::Config, Option<PathBuf>)> {
         let mut themes = HashMap::new();
 
         for (key, (name, theme, path)) in
-            Self::load_plugin_icon_themes(disabled_volts)
+            Self::load_plugin_icon_themes(disabled_volts, extra_plugin_paths)
         {
             themes.insert(key, (name, theme, Some(path)));
         }
@@ -447,9 +488,10 @@ impl LapceConfig {
 
     fn load_plugin_color_themes(
         disabled_volts: &[VoltID],
+        extra_plugin_paths: &[PathBuf],
     ) -> HashMap<String, (String, config::Config)> {
         let mut themes: HashMap<String, (String, config::Config)> = HashMap::new();
-        for meta in find_all_volts() {
+        for meta in find_all_volts(extra_plugin_paths) {
             if disabled_volts.contains(&meta.id()) {
                 continue;
             }
@@ -468,10 +510,11 @@ impl LapceConfig {
 
     fn load_plugin_icon_themes(
         disabled_volts: &[VoltID],
+        extra_plugin_paths: &[PathBuf],
     ) -> HashMap<String, (String, config::Config, PathBuf)> {
         let mut themes: HashMap<String, (String, config::Config, PathBuf)> =
             HashMap::new();
-        for meta in find_all_volts() {
+        for meta in find_all_volts(extra_plugin_paths) {
             if disabled_volts.contains(&meta.id()) {
                 continue;
             }
@@ -552,7 +595,7 @@ impl LapceConfig {
         });
 
         svg.unwrap_or_else(|| {
-            let name = self.default_icon_theme.ui.get(icon).unwrap();
+            let name = DEFAULT_ICON_THEME_ICON_CONFIG.ui.get(icon).unwrap();
             self.svg_store.write().get_default_svg(name)
         })
     }
@@ -661,37 +704,37 @@ impl LapceConfig {
 
     pub fn terminal_get_color(
         &self,
-        color: &alacritty_terminal::ansi::Color,
+        color: &alacritty_terminal::vte::ansi::Color,
         colors: &alacritty_terminal::term::color::Colors,
     ) -> Color {
         match color {
-            alacritty_terminal::ansi::Color::Named(color) => {
+            alacritty_terminal::vte::ansi::Color::Named(color) => {
                 self.terminal_get_named_color(color)
             }
-            alacritty_terminal::ansi::Color::Spec(rgb) => {
+            alacritty_terminal::vte::ansi::Color::Spec(rgb) => {
                 Color::rgb8(rgb.r, rgb.g, rgb.b)
             }
-            alacritty_terminal::ansi::Color::Indexed(index) => {
+            alacritty_terminal::vte::ansi::Color::Indexed(index) => {
                 if let Some(rgb) = colors[*index as usize] {
                     return Color::rgb8(rgb.r, rgb.g, rgb.b);
                 }
-                const NAMED_COLORS: [alacritty_terminal::ansi::NamedColor; 16] = [
-                    alacritty_terminal::ansi::NamedColor::Black,
-                    alacritty_terminal::ansi::NamedColor::Red,
-                    alacritty_terminal::ansi::NamedColor::Green,
-                    alacritty_terminal::ansi::NamedColor::Yellow,
-                    alacritty_terminal::ansi::NamedColor::Blue,
-                    alacritty_terminal::ansi::NamedColor::Magenta,
-                    alacritty_terminal::ansi::NamedColor::Cyan,
-                    alacritty_terminal::ansi::NamedColor::White,
-                    alacritty_terminal::ansi::NamedColor::BrightBlack,
-                    alacritty_terminal::ansi::NamedColor::BrightRed,
-                    alacritty_terminal::ansi::NamedColor::BrightGreen,
-                    alacritty_terminal::ansi::NamedColor::BrightYellow,
-                    alacritty_terminal::ansi::NamedColor::BrightBlue,
-                    alacritty_terminal::ansi::NamedColor::BrightMagenta,
-                    alacritty_terminal::ansi::NamedColor::BrightCyan,
-                    alacritty_terminal::ansi::NamedColor::BrightWhite,
+                const NAMED_COLORS: [alacritty_terminal::vte::ansi::NamedColor; 16] = [
+                    alacritty_terminal::vte::ansi::NamedColor::Black,
+                    alacritty_terminal::vte::ansi::NamedColor::Red,
+                    alacritty_terminal::vte::ansi::NamedColor::Green,
+                    alacritty_terminal::vte::ansi::NamedColor::Yellow,
+                    alacritty_terminal::vte::ansi::NamedColor::Blue,
+                    alacritty_terminal::vte::ansi::NamedColor::Magenta,
+                    alacritty_terminal::vte::ansi::NamedColor::Cyan,
+                    alacritty_terminal::vte::ansi::NamedColor::White,
+                    alacritty_terminal::vte::ansi::NamedColor::BrightBlack,
+                    alacritty_terminal::vte::ansi::NamedColor::BrightRed,
+                    alacritty_terminal::vte::ansi::NamedColor::BrightGreen,
+                    alacritty_terminal::vte::ansi::NamedColor::BrightYellow,
+                    alacritty_terminal::vte::ansi::NamedColor::BrightBlue,
+                    alacritty_terminal::vte::ansi::NamedColor::BrightMagenta,
+                    alacritty_terminal::vte::ansi::NamedColor::BrightCyan,
+                    alacritty_terminal::vte::ansi::NamedColor::BrightWhite,
                 ];
                 if (*index as usize) < NAMED_COLORS.len() {
                     self.terminal_get_named_color(&NAMED_COLORS[*index as usize])
@@ -704,94 +747,94 @@ impl LapceConfig {
 
     fn terminal_get_named_color(
         &self,
-        color: &alacritty_terminal::ansi::NamedColor,
+        color: &alacritty_terminal::vte::ansi::NamedColor,
     ) -> Color {
         let (color, alpha) = match color {
-            alacritty_terminal::ansi::NamedColor::Cursor => {
+            alacritty_terminal::vte::ansi::NamedColor::Cursor => {
                 (LapceColor::TERMINAL_CURSOR, 1.0)
             }
-            alacritty_terminal::ansi::NamedColor::Foreground => {
+            alacritty_terminal::vte::ansi::NamedColor::Foreground => {
                 (LapceColor::TERMINAL_FOREGROUND, 1.0)
             }
-            alacritty_terminal::ansi::NamedColor::Background => {
+            alacritty_terminal::vte::ansi::NamedColor::Background => {
                 (LapceColor::TERMINAL_BACKGROUND, 1.0)
             }
-            alacritty_terminal::ansi::NamedColor::Blue => {
+            alacritty_terminal::vte::ansi::NamedColor::Blue => {
                 (LapceColor::TERMINAL_BLUE, 1.0)
             }
-            alacritty_terminal::ansi::NamedColor::Green => {
+            alacritty_terminal::vte::ansi::NamedColor::Green => {
                 (LapceColor::TERMINAL_GREEN, 1.0)
             }
-            alacritty_terminal::ansi::NamedColor::Yellow => {
+            alacritty_terminal::vte::ansi::NamedColor::Yellow => {
                 (LapceColor::TERMINAL_YELLOW, 1.0)
             }
-            alacritty_terminal::ansi::NamedColor::Red => {
+            alacritty_terminal::vte::ansi::NamedColor::Red => {
                 (LapceColor::TERMINAL_RED, 1.0)
             }
-            alacritty_terminal::ansi::NamedColor::White => {
+            alacritty_terminal::vte::ansi::NamedColor::White => {
                 (LapceColor::TERMINAL_WHITE, 1.0)
             }
-            alacritty_terminal::ansi::NamedColor::Black => {
+            alacritty_terminal::vte::ansi::NamedColor::Black => {
                 (LapceColor::TERMINAL_BLACK, 1.0)
             }
-            alacritty_terminal::ansi::NamedColor::Cyan => {
+            alacritty_terminal::vte::ansi::NamedColor::Cyan => {
                 (LapceColor::TERMINAL_CYAN, 1.0)
             }
-            alacritty_terminal::ansi::NamedColor::Magenta => {
+            alacritty_terminal::vte::ansi::NamedColor::Magenta => {
                 (LapceColor::TERMINAL_MAGENTA, 1.0)
             }
-            alacritty_terminal::ansi::NamedColor::BrightBlue => {
+            alacritty_terminal::vte::ansi::NamedColor::BrightBlue => {
                 (LapceColor::TERMINAL_BRIGHT_BLUE, 1.0)
             }
-            alacritty_terminal::ansi::NamedColor::BrightGreen => {
+            alacritty_terminal::vte::ansi::NamedColor::BrightGreen => {
                 (LapceColor::TERMINAL_BRIGHT_GREEN, 1.0)
             }
-            alacritty_terminal::ansi::NamedColor::BrightYellow => {
+            alacritty_terminal::vte::ansi::NamedColor::BrightYellow => {
                 (LapceColor::TERMINAL_BRIGHT_YELLOW, 1.0)
             }
-            alacritty_terminal::ansi::NamedColor::BrightRed => {
+            alacritty_terminal::vte::ansi::NamedColor::BrightRed => {
                 (LapceColor::TERMINAL_BRIGHT_RED, 1.0)
             }
-            alacritty_terminal::ansi::NamedColor::BrightWhite => {
+            alacritty_terminal::vte::ansi::NamedColor::BrightWhite => {
                 (LapceColor::TERMINAL_BRIGHT_WHITE, 1.0)
             }
-            alacritty_terminal::ansi::NamedColor::BrightBlack => {
+            alacritty_terminal::vte::ansi::NamedColor::BrightBlack => {
                 (LapceColor::TERMINAL_BRIGHT_BLACK, 1.0)
             }
-            alacritty_terminal::ansi::NamedColor::BrightCyan => {
+            alacritty_terminal::vte::ansi::NamedColor::BrightCyan => {
                 (LapceColor::TERMINAL_BRIGHT_CYAN, 1.0)
             }
-            alacritty_terminal::ansi::NamedColor::BrightMagenta => {
+            alacritty_terminal::vte::ansi::NamedColor::BrightMagenta => {
                 (LapceColor::TERMINAL_BRIGHT_MAGENTA, 1.0)
             }
-            alacritty_terminal::ansi::NamedColor::BrightForeground => {
+            alacritty_terminal::vte::ansi::NamedColor::BrightForeground => {
                 (LapceColor::TERMINAL_FOREGROUND, 1.0)
             }
-            alacritty_terminal::ansi::NamedColor::DimBlack => {
+            alacritty_terminal::vte::ansi::NamedColor::DimBlack => {
                 (LapceColor::TERMINAL_BLACK, 0.66)
             }
-            alacritty_terminal::ansi::NamedColor::DimRed => {
+            alacritty_terminal::vte::ansi::NamedColor::DimRed => {
                 (LapceColor::TERMINAL_RED, 0.66)
             }
-            alacritty_terminal::ansi::NamedColor::DimGreen => {
+            alacritty_terminal::vte::ansi::NamedColor::DimGreen => {
                 (LapceColor::TERMINAL_GREEN, 0.66)
             }
-            alacritty_terminal::ansi::NamedColor::DimYellow => {
+            alacritty_terminal::vte::ansi::NamedColor::DimYellow => {
                 (LapceColor::TERMINAL_YELLOW, 0.66)
             }
-            alacritty_terminal::ansi::NamedColor::DimBlue => {
+            alacritty_terminal::vte::ansi::NamedColor::DimBlue => {
                 (LapceColor::TERMINAL_BLUE, 0.66)
             }
-            alacritty_terminal::ansi::NamedColor::DimMagenta => {
+            alacritty_terminal::vte::ansi::NamedColor::DimMagenta => {
                 (LapceColor::TERMINAL_MAGENTA, 0.66)
             }
-            alacritty_terminal::ansi::NamedColor::DimCyan => {
+            alacritty_terminal::vte::ansi::NamedColor::DimCyan => {
                 (LapceColor::TERMINAL_CYAN, 0.66)
             }
-            alacritty_terminal::ansi::NamedColor::DimWhite => {
+            alacritty_terminal::vte::ansi::NamedColor::DimWhite => {
                 (LapceColor::TERMINAL_WHITE, 0.66)
             }
-            alacritty_terminal::ansi::NamedColor::DimForeground => {
+            alacritty_terminal::vte::ansi::NamedColor::DimForeground => {
                 (LapceColor::TERMINAL_FOREGROUND, 0.66)
             }
         };
@@ -849,7 +892,7 @@ impl LapceConfig {
                             == self
                                 .terminal
                                 .default_profile
-                                .get(&std::env::consts::OS.to_string())
+                                .get(std::env::consts::OS)
                                 .unwrap_or(&String::from("default"))
                     })
                     .unwrap_or(0),
@@ -897,6 +940,16 @@ impl LapceConfig {
         key: &str,
         value: toml_edit::Value,
     ) -> Option<()> {
+        // TODO: This is a hack to fix the fact that terminal default profile is saved in a
+        // different manner than other fields. As it is per-operating-system.
+        // Thus we have to instead set the terminal.default-profile.{OS}
+        // It would be better to not need a special hack.
+        let (parent, key) = if parent == "terminal" && key == "default-profile" {
+            ("terminal.default-profile", std::env::consts::OS)
+        } else {
+            (parent, key)
+        };
+
         let mut main_table = Self::get_file_table().unwrap_or_default();
 
         // Find the container table

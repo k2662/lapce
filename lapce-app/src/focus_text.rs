@@ -1,20 +1,18 @@
 use floem::{
     cosmic_text::{Attrs, AttrsList, FamilyOwned, TextLayout, Weight},
-    id::Id,
     peniko::{
         kurbo::{Point, Rect},
         Color,
     },
-    prop_extracter,
+    prop_extractor,
     reactive::create_effect,
     style::{FontFamily, FontSize, LineHeight, Style, TextColor},
-    taffy::prelude::Node,
-    view::{View, ViewData},
-    Renderer,
+    taffy::prelude::NodeId,
+    Renderer, View, ViewId,
 };
 
-prop_extracter! {
-    Extracter {
+prop_extractor! {
+    Extractor {
         color: TextColor,
         font_size: FontSize,
         font_family: FontFamily,
@@ -33,26 +31,25 @@ pub fn focus_text(
     focus_indices: impl Fn() -> Vec<usize> + 'static,
     focus_color: impl Fn() -> Color + 'static,
 ) -> FocusText {
-    let id = Id::next();
+    let id = ViewId::new();
 
     create_effect(move |_| {
         let new_text = text();
-        id.update_state(FocusTextState::Text(new_text), false);
+        id.update_state(FocusTextState::Text(new_text));
     });
 
     create_effect(move |_| {
         let focus_color = focus_color();
-        id.update_state(FocusTextState::FocusColor(focus_color), false);
+        id.update_state(FocusTextState::FocusColor(focus_color));
     });
 
     create_effect(move |_| {
         let focus_indices = focus_indices();
-        id.update_state(FocusTextState::FocusIndices(focus_indices), false);
+        id.update_state(FocusTextState::FocusIndices(focus_indices));
     });
 
     FocusText {
         id,
-        data: ViewData::new(id),
         text: "".to_string(),
         text_layout: None,
         focus_color: Color::default(),
@@ -66,17 +63,16 @@ pub fn focus_text(
 }
 
 pub struct FocusText {
-    id: Id,
-    data: ViewData,
+    id: ViewId,
     text: String,
     text_layout: Option<TextLayout>,
     focus_color: Color,
     focus_indices: Vec<usize>,
-    text_node: Option<Node>,
+    text_node: Option<NodeId>,
     available_text: Option<String>,
     available_width: Option<f32>,
     available_text_layout: Option<TextLayout>,
-    style: Extracter,
+    style: Extractor,
 }
 
 impl FocusText {
@@ -165,21 +161,13 @@ impl FocusText {
 }
 
 impl View for FocusText {
-    fn id(&self) -> floem::id::Id {
+    fn id(&self) -> ViewId {
         self.id
-    }
-
-    fn view_data(&self) -> &ViewData {
-        &self.data
-    }
-
-    fn view_data_mut(&mut self) -> &mut ViewData {
-        &mut self.data
     }
 
     fn update(
         &mut self,
-        cx: &mut floem::context::UpdateCx,
+        _cx: &mut floem::context::UpdateCx,
         state: Box<dyn std::any::Any>,
     ) {
         if let Ok(state) = state.downcast() {
@@ -195,22 +183,22 @@ impl View for FocusText {
                 }
             }
             self.set_text_layout();
-            cx.request_layout(self.id());
+            self.id.request_layout();
         }
     }
 
     fn style(&mut self, cx: &mut floem::context::StyleCx<'_>) {
         if self.style.read(cx) {
             self.set_text_layout();
-            cx.app_state_mut().request_layout(self.id());
+            self.id.request_layout();
         }
     }
 
     fn layout(
         &mut self,
         cx: &mut floem::context::LayoutCx,
-    ) -> floem::taffy::prelude::Node {
-        cx.layout_node(self.id, true, |cx| {
+    ) -> floem::taffy::prelude::NodeId {
+        cx.layout_node(self.id, true, |_cx| {
             if self.text_layout.is_none() {
                 self.set_text_layout();
             }
@@ -221,22 +209,22 @@ impl View for FocusText {
             let height = size.height as f32;
 
             if self.text_node.is_none() {
-                self.text_node = Some(cx.new_node());
+                self.text_node = Some(self.id.new_taffy_node());
             }
             let text_node = self.text_node.unwrap();
 
             let style = Style::new().width(width).height(height).to_taffy_style();
-            cx.set_style(text_node, style);
+            self.id.set_taffy_style(text_node, style);
             vec![text_node]
         })
     }
 
     fn compute_layout(
         &mut self,
-        cx: &mut floem::context::ComputeLayoutCx,
+        _cx: &mut floem::context::ComputeLayoutCx,
     ) -> Option<Rect> {
         let text_node = self.text_node.unwrap();
-        let layout = cx.layout(text_node).unwrap();
+        let layout = self.id.taffy_layout(text_node).unwrap_or_default();
         let text_layout = self.text_layout.as_ref().unwrap();
         let width = text_layout.size().width as f32;
         if width > layout.size.width {
@@ -287,7 +275,7 @@ impl View for FocusText {
 
     fn paint(&mut self, cx: &mut floem::context::PaintCx) {
         let text_node = self.text_node.unwrap();
-        let location = cx.layout(text_node).unwrap().location;
+        let location = self.id.taffy_layout(text_node).unwrap_or_default().location;
         let point = Point::new(location.x as f64, location.y as f64);
         if let Some(text_layout) = self.available_text_layout.as_ref() {
             cx.draw_text(text_layout, point);

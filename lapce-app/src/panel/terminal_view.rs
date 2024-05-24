@@ -1,16 +1,16 @@
 use std::rc::Rc;
 
 use floem::{
+    event::EventPropagation,
     event::{Event, EventListener},
     kurbo::Size,
     reactive::create_rw_signal,
-    view::View,
     views::{
         container, dyn_stack, empty, label,
-        scroll::{scroll, Thickness},
+        scroll::{scroll, Thickness, VerticalScrollAsHorizontal},
         stack, svg, tab, Decorators,
     },
-    EventPropagation,
+    View,
 };
 
 use super::kind::PanelKind;
@@ -136,6 +136,7 @@ fn terminal_tab_header(window_tab_data: Rc<WindowTabData>) -> impl View {
                                 },
                                 || false,
                                 || false,
+                                || "Close",
                                 config,
                             )
                             .style(|s| s.margin_horiz(6.0)),
@@ -194,7 +195,6 @@ fn terminal_tab_header(window_tab_data: Rc<WindowTabData>) -> impl View {
                 )
             },
         ))
-        .vertical_scroll_as_horizontal(|| true)
         .on_resize(move |rect| {
             if rect.size() != scroll_size.get_untracked() {
                 scroll_size.set(rect.size());
@@ -203,7 +203,8 @@ fn terminal_tab_header(window_tab_data: Rc<WindowTabData>) -> impl View {
         .style(move |s| {
             let header_width = header_width.get();
             let icon_width = icon_width.get();
-            s.absolute()
+            s.set(VerticalScrollAsHorizontal, true)
+                .absolute()
                 .max_width(header_width - icon_width)
                 .set(Thickness, 3)
         }),
@@ -218,6 +219,7 @@ fn terminal_tab_header(window_tab_data: Rc<WindowTabData>) -> impl View {
             },
             || false,
             || false,
+            || "New Terminal",
             config,
         ))
         .on_resize(move |rect| {
@@ -251,6 +253,8 @@ fn terminal_tab_split(
     terminal_tab_data: TerminalTabData,
 ) -> impl View {
     let config = terminal_panel_data.common.config;
+    let internal_command = terminal_panel_data.common.internal_command;
+    let workspace = terminal_panel_data.workspace.clone();
     let active = terminal_tab_data.active;
     let terminal_tab_scope = terminal_tab_data.scope;
     dyn_stack(
@@ -275,6 +279,8 @@ fn terminal_tab_split(
                     terminal.run_debug.read_only(),
                     terminal_panel_data,
                     terminal.launch_error,
+                    internal_command,
+                    workspace.clone(),
                 )
                 .on_event_cont(EventListener::PointerDown, move |_| {
                     active.set(index.get_untracked());

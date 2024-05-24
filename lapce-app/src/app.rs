@@ -3,6 +3,7 @@ use std::os::windows::process::CommandExt;
 use std::{
     io::{BufReader, Read, Write},
     ops::Range,
+    path::PathBuf,
     process::Stdio,
     rc::Rc,
     sync::{atomic::AtomicU64, Arc},
@@ -13,7 +14,7 @@ use clap::Parser;
 use crossbeam_channel::Sender;
 use floem::{
     cosmic_text::{Style as FontStyle, Weight},
-    event::{Event, EventListener},
+    event::{Event, EventListener, EventPropagation},
     ext_event::create_signal_from_channel,
     menu::{Menu, MenuItem},
     peniko::{
@@ -29,14 +30,17 @@ use floem::{
         Style,
     },
     unit::PxPctAuto,
-    view::View,
     views::{
-        clip, container, container_box, drag_resize_window_area, drag_window_area,
-        dyn_stack, empty, label, rich_text, scroll::scroll, stack, svg, tab, text,
-        virtual_stack, Decorators, VirtualDirection, VirtualItemSize, VirtualVector,
+        clip, container, drag_resize_window_area, drag_window_area, dyn_stack,
+        empty, label, rich_text,
+        scroll::{
+            scroll, HideBar, PropagatePointerWheel, VerticalScrollAsHorizontal,
+        },
+        stack, svg, tab, text, tooltip, virtual_stack, Decorators, VirtualDirection,
+        VirtualItemSize, VirtualVector,
     },
     window::{ResizeDirection, WindowConfig, WindowId},
-    EventPropagation,
+    IntoView, View,
 };
 use lapce_core::{
     command::{EditCommand, FocusCommand},
@@ -88,7 +92,7 @@ use crate::{
     plugin::{plugin_info_view, PluginData},
     settings::{settings_view, theme_color_settings_view},
     status::status,
-    text_input::text_input,
+    text_input::TextInputBuilder,
     title::{title, window_controls_view},
     update::ReleaseInfo,
     window::{TabsInfo, WindowData, WindowInfo},
@@ -107,6 +111,13 @@ struct Cli {
     /// Don't return instantly when opened in a terminal
     #[clap(short, long, action)]
     wait: bool,
+
+    /// Path(s) to plugins to load.  
+    /// This is primarily used for plugin development to make it easier to test changes to the
+    /// plugin without needing to copy the plugin to the plugins directory.  
+    /// This will cause any plugin with the same author & name to not run.
+    #[clap(long, action)]
+    plugin_path: Vec<PathBuf>,
 
     /// Paths to file(s) and/or folder(s) to open.
     /// When path is a file (that exists or not),
@@ -143,11 +154,14 @@ pub struct AppData {
     pub watcher: Arc<notify::RecommendedWatcher>,
     pub tracing_handle: Handle<Targets>,
     pub config: RwSignal<Arc<LapceConfig>>,
+    /// Paths to extra plugins to load
+    pub plugin_paths: Arc<Vec<PathBuf>>,
 }
 
 impl AppData {
     pub fn reload_config(&self) {
-        let config = LapceConfig::load(&LapceWorkspace::default(), &[]);
+        let config =
+            LapceConfig::load(&LapceWorkspace::default(), &[], &self.plugin_paths);
         self.config.set(Arc::new(config));
         let windows = self.windows.get_untracked();
         for (_, window) in windows {
@@ -172,7 +186,9 @@ impl AppData {
     }
 
     fn default_window_config(&self) -> WindowConfig {
-        WindowConfig::default().themed(false).title("Lapce")
+        WindowConfig::default()
+            .apply_default_theme(false)
+            .title("Lapce")
     }
 
     pub fn new_window(&self) {
@@ -418,11 +434,14 @@ impl AppData {
     }
 
     fn app_view(&self, window_id: WindowId, info: WindowInfo) -> impl View {
+        let app_view_id = create_rw_signal(floem::ViewId::new());
         let window_data = WindowData::new(
             window_id,
+            app_view_id,
             info,
             self.window_scale,
             self.latest_release.read_only(),
+            self.plugin_paths.clone(),
             self.app_command,
         );
         self.windows.update(|windows| {
@@ -519,6 +538,10 @@ impl AppData {
             ))
             .style(|s| s.flex_col().size_full());
         let view_id = view.id();
+        app_view_id.set(view_id);
+
+        view_id.request_focus();
+
         view.window_scale(move || window_scale.get())
             .keyboard_navigatable()
             .on_event(EventListener::KeyDown, move |event| {
@@ -656,6 +679,7 @@ fn editor_tab_header(
                 },
                 || false,
                 || false,
+                || "Close",
                 config,
             )
             .on_event_stop(EventListener::PointerDown, |_| {})
@@ -675,26 +699,24 @@ fn editor_tab_header(
             };
 
             match tab_close_button_style {
-                TabCloseButton::Left => container_box(
+                TabCloseButton::Left => container(
                     stack((tab_close_button, tab_content, tab_icon))
                         .style(tab_style),
                 ),
-                TabCloseButton::Right => container_box(
+                TabCloseButton::Right => container(
                     stack((tab_icon, tab_content, tab_close_button))
                         .style(tab_style),
                 ),
                 TabCloseButton::Off => {
-                    container_box(stack((tab_icon, tab_content)).style(tab_style))
+                    container(stack((tab_icon, tab_content)).style(tab_style))
                 }
             }
         };
 
         let confirmed = match local_child {
-            EditorTabChild::Editor(editor_id) => editors.with_untracked(|editors| {
-                editors
-                    .get(&editor_id)
-                    .map(|editor_data| editor_data.confirmed)
-            }),
+            EditorTabChild::Editor(editor_id) => {
+                editors.editor_untracked(editor_id).map(|e| e.confirmed)
+            }
             EditorTabChild::DiffEditor(diff_editor_id) => diff_editors
                 .with_untracked(|diff_editors| {
                     diff_editors
@@ -876,6 +898,7 @@ fn editor_tab_header(
                         },
                         || false,
                         || false,
+                        || "Previous Tab",
                         config,
                     )
                     .style(|s| s.margin_horiz(6.0).margin_vert(7.0)),
@@ -887,6 +910,7 @@ fn editor_tab_header(
                         },
                         || false,
                         || false,
+                        || "Next Tab",
                         config,
                     )
                     .style(|s| s.margin_right(6.0)),
@@ -911,16 +935,16 @@ fn editor_tab_header(
             .on_scroll(move |rect| {
                 scroll_offset.set(rect);
             })
-            .on_ensure_visible(move || {
+            .ensure_visible(move || {
                 let active = editor_tab_active.get();
                 editor_tab
                     .with_untracked(|editor_tab| editor_tab.children[active].1)
                     .get_untracked()
             })
-            .hide_bar(|| true)
-            .vertical_scroll_as_horizontal(|| true)
             .style(|s| {
-                s.position(Position::Absolute)
+                s.set(HideBar, true)
+                    .set(VerticalScrollAsHorizontal, true)
+                    .position(Position::Absolute)
                     .height_full()
                     .max_width_full()
             })
@@ -967,6 +991,7 @@ fn editor_tab_header(
                         },
                         || false,
                         || false,
+                        || "Split Horizontally",
                         config,
                     )
                     .style(|s| s.margin_left(6.0)),
@@ -981,6 +1006,7 @@ fn editor_tab_header(
                         },
                         || false,
                         || false,
+                        || "Close All",
                         config,
                     )
                     .style(|s| s.margin_horiz(6.0)),
@@ -1027,9 +1053,7 @@ fn editor_tab_content(
         let common = common.clone();
         let child = match child {
             EditorTabChild::Editor(editor_id) => {
-                let editor_data = editors
-                    .with_untracked(|editors| editors.get(&editor_id).cloned());
-                if let Some(editor_data) = editor_data {
+                if let Some(editor_data) = editors.editor_untracked(editor_id) {
                     let editor_scope = editor_data.scope;
                     let editor_tab_id = editor_data.editor_tab_id;
                     let is_active = move |tracked: bool| {
@@ -1056,14 +1080,14 @@ fn editor_tab_content(
                         }
                     };
                     let editor_data = create_rw_signal(editor_data);
-                    container_box(editor_container_view(
+                    container(editor_container_view(
                         window_tab_data.clone(),
                         workspace.clone(),
                         is_active,
                         editor_data,
                     ))
                 } else {
-                    container_box(text("emtpy editor"))
+                    container(text("empty editor"))
                 }
             }
             EditorTabChild::DiffEditor(diff_editor_id) => {
@@ -1096,10 +1120,10 @@ fn editor_tab_content(
                             false
                         }
                     };
-                    let left_viewport = diff_editor_data.left.viewport;
-                    let left_scroll_to = diff_editor_data.left.scroll_to;
-                    let right_viewport = diff_editor_data.right.viewport;
-                    let right_scroll_to = diff_editor_data.right.scroll_to;
+                    let left_viewport = diff_editor_data.left.viewport();
+                    let left_scroll_to = diff_editor_data.left.scroll_to();
+                    let right_viewport = diff_editor_data.right.viewport();
+                    let right_scroll_to = diff_editor_data.right.scroll_to();
                     create_effect(move |_| {
                         let left_viewport = left_viewport.get();
                         if right_viewport.get_untracked() != left_viewport {
@@ -1118,7 +1142,7 @@ fn editor_tab_content(
                         create_rw_signal(diff_editor_data.left.clone());
                     let right_editor =
                         create_rw_signal(diff_editor_data.right.clone());
-                    container_box(
+                    container(
                         stack((
                             container(editor_container_view(
                                 window_tab_data.clone(),
@@ -1165,28 +1189,28 @@ fn editor_tab_content(
                                 s.height_full().flex_grow(1.0).flex_basis(0.0)
                             }),
                             diff_show_more_section_view(
-                                diff_editor_data.left.clone(),
-                                diff_editor_data.right.clone(),
+                                &diff_editor_data.left,
+                                &diff_editor_data.right,
                             ),
                         ))
-                        .style(|s| s.size_full()),
+                        .style(|s: Style| s.size_full()),
                     )
                     .on_cleanup(move || {
                         diff_editor_scope.dispose();
                     })
                 } else {
-                    container_box(text("emtpy diff editor"))
+                    container(text("empty diff editor"))
                 }
             }
             EditorTabChild::Settings(_) => {
-                container_box(settings_view(plugin.installed, common))
+                container(settings_view(plugin.installed, editors, common))
             }
             EditorTabChild::ThemeColorSettings(_) => {
-                container_box(theme_color_settings_view(common))
+                container(theme_color_settings_view(editors, common))
             }
-            EditorTabChild::Keymap(_) => container_box(keymap_view(common)),
+            EditorTabChild::Keymap(_) => container(keymap_view(editors, common)),
             EditorTabChild::Volt(_, id) => {
-                container_box(plugin_info_view(plugin.clone(), id))
+                container(plugin_info_view(plugin.clone(), id))
             }
         };
         child.style(|s| s.size_full())
@@ -1682,7 +1706,7 @@ fn split_list(
                     let editor_tab_data = editor_tabs
                         .with_untracked(|tabs| tabs.get(editor_tab_id).cloned());
                     if let Some(editor_tab_data) = editor_tab_data {
-                        container_box(editor_tab(
+                        container(editor_tab(
                             window_tab_data.clone(),
                             plugin.clone(),
                             active_editor_tab,
@@ -1690,7 +1714,7 @@ fn split_list(
                             dragging,
                         ))
                     } else {
-                        container_box(text("emtpy editor tab"))
+                        container(text("empty editor tab"))
                     }
                 }
                 SplitContent::Split(split_id) => {
@@ -1704,7 +1728,7 @@ fn split_list(
                             dragging,
                         )
                     } else {
-                        container_box(text("emtpy split"))
+                        container(text("empty split"))
                     }
                 }
             };
@@ -1750,7 +1774,7 @@ fn split_list(
                 .style(move |s| s.flex_grow(split_size.get() as f32).flex_basis(0.0))
         }
     };
-    container_box(
+    container(
         stack((
             dyn_stack(items, key, view_fn).style(move |s| {
                 s.flex_direction(match direction() {
@@ -1807,53 +1831,123 @@ fn main_split(window_tab_data: Rc<WindowTabData>) -> impl View {
     })
 }
 
-pub fn clickable_icon(
+pub fn not_clickable_icon<S: std::fmt::Display + 'static>(
+    icon: impl Fn() -> &'static str + 'static,
+    active_fn: impl Fn() -> bool + 'static,
+    disabled_fn: impl Fn() -> bool + 'static + Copy,
+    tooltip_: impl Fn() -> S + 'static + Clone,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    tooltip_label(
+        config,
+        clickable_icon_base(
+            icon,
+            None::<Box<dyn Fn()>>,
+            active_fn,
+            disabled_fn,
+            config,
+        ),
+        tooltip_,
+    )
+}
+
+pub fn clickable_icon<S: std::fmt::Display + 'static>(
     icon: impl Fn() -> &'static str + 'static,
     on_click: impl Fn() + 'static,
-    active_fn: impl Fn() -> bool + 'static + Copy,
+    active_fn: impl Fn() -> bool + 'static,
+    disabled_fn: impl Fn() -> bool + 'static + Copy,
+    tooltip_: impl Fn() -> S + 'static + Clone,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    tooltip_label(
+        config,
+        clickable_icon_base(icon, Some(on_click), active_fn, disabled_fn, config),
+        tooltip_,
+    )
+}
+
+pub fn clickable_icon_base(
+    icon: impl Fn() -> &'static str + 'static,
+    on_click: Option<impl Fn() + 'static>,
+    active_fn: impl Fn() -> bool + 'static,
     disabled_fn: impl Fn() -> bool + 'static + Copy,
     config: ReadSignal<Arc<LapceConfig>>,
 ) -> impl View {
-    container(
-        container(
-            svg(move || config.get().ui_svg(icon()))
-                .style(move |s| {
-                    let config = config.get();
-                    let size = config.ui.icon_size() as f32;
-                    s.size(size, size)
-                        .color(config.color(LapceColor::LAPCE_ICON_ACTIVE))
-                        .disabled(|s| {
-                            s.color(config.color(LapceColor::LAPCE_ICON_INACTIVE))
-                                .cursor(CursorStyle::Default)
-                        })
-                })
-                .disabled(disabled_fn),
-        )
-        .on_click_stop(move |_| {
+    let view = container(
+        svg(move || config.get().ui_svg(icon()))
+            .style(move |s| {
+                let config = config.get();
+                let size = config.ui.icon_size() as f32;
+                s.size(size, size)
+                    .color(config.color(LapceColor::LAPCE_ICON_ACTIVE))
+                    .disabled(|s| {
+                        s.color(config.color(LapceColor::LAPCE_ICON_INACTIVE))
+                            .cursor(CursorStyle::Default)
+                    })
+            })
+            .disabled(disabled_fn),
+    )
+    .disabled(disabled_fn)
+    .style(move |s| {
+        let config = config.get();
+        s.padding(4.0)
+            .border_radius(6.0)
+            .border(1.0)
+            .border_color(Color::TRANSPARENT)
+            .apply_if(active_fn(), |s| {
+                s.border_color(config.color(LapceColor::EDITOR_CARET))
+            })
+            .hover(|s| {
+                s.cursor(CursorStyle::Pointer)
+                    .background(config.color(LapceColor::PANEL_HOVERED_BACKGROUND))
+            })
+            .active(|s| {
+                s.background(
+                    config.color(LapceColor::PANEL_HOVERED_ACTIVE_BACKGROUND),
+                )
+            })
+    });
+
+    if let Some(on_click) = on_click {
+        view.on_click_stop(move |_| {
             on_click();
         })
-        .disabled(disabled_fn)
-        .style(move |s| {
-            let config = config.get();
-            s.padding(4.0)
-                .border_radius(6.0)
-                .border(1.0)
-                .border_color(Color::TRANSPARENT)
-                .apply_if(active_fn(), |s| {
-                    s.border_color(config.color(LapceColor::EDITOR_CARET))
-                })
-                .hover(|s| {
-                    s.cursor(CursorStyle::Pointer).background(
-                        config.color(LapceColor::PANEL_HOVERED_BACKGROUND),
-                    )
-                })
-                .active(|s| {
-                    s.background(
-                        config.color(LapceColor::PANEL_HOVERED_ACTIVE_BACKGROUND),
-                    )
-                })
-        }),
-    )
+    } else {
+        view
+    }
+}
+
+/// A tooltip with a label inside.  
+/// When styling an element that has the tooltip, it will style the child rather than the tooltip
+/// label.
+pub fn tooltip_label<S: std::fmt::Display + 'static, V: View + 'static>(
+    config: ReadSignal<Arc<LapceConfig>>,
+    child: V,
+    text: impl Fn() -> S + 'static + Clone,
+) -> impl View {
+    tooltip(child, move || tooltip_tip(config, label(text.clone())))
+}
+
+fn tooltip_tip<V: View + 'static>(
+    config: ReadSignal<Arc<LapceConfig>>,
+    child: V,
+) -> impl IntoView {
+    container(child).style(move |s| {
+        let config = config.get();
+        s.padding_horiz(10.0)
+            .padding_vert(5.0)
+            .font_size(config.ui.font_size() as f32)
+            .font_family(config.ui.font_family.clone())
+            .color(config.color(LapceColor::TOOLTIP_FOREGROUND))
+            .background(config.color(LapceColor::TOOLTIP_BACKGROUND))
+            .border(1)
+            .border_radius(6)
+            .border_color(config.color(LapceColor::LAPCE_BORDER))
+            .box_shadow_blur(3.0)
+            .box_shadow_color(config.color(LapceColor::LAPCE_DROPDOWN_SHADOW))
+            .margin_left(0.0)
+            .margin_top(4.0)
+    })
 }
 
 fn workbench(window_tab_data: Rc<WindowTabData>) -> impl View {
@@ -1876,7 +1970,7 @@ fn workbench(window_tab_data: Rc<WindowTabData>) -> impl View {
                     main_split_width.set(width);
                 }
             })
-            .style(|s| s.flex_col().size_full())
+            .style(|s| s.flex_col().flex_grow(1.0))
         },
         panel_container_view(window_tab_data.clone(), PanelContainerPosition::Right),
         window_message_view(window_tab_data.messages, window_tab_data.common.config),
@@ -1939,7 +2033,7 @@ fn palette_item(
 
             let path = path.to_path_buf();
             let style_path = path.clone();
-            container_box(
+            container(
                 stack((
                     svg(move || config.get().file_svg(&path).0).style(move |s| {
                         let config = config.get();
@@ -2004,7 +2098,7 @@ fn palette_item(
                     }
                 })
                 .collect();
-            container_box(
+            container(
                 stack((
                     svg(move || {
                         let config = config.get();
@@ -2085,7 +2179,7 @@ fn palette_item(
                     }
                 })
                 .collect();
-            container_box(
+            container(
                 stack((
                     svg(move || {
                         let config = config.get();
@@ -2157,7 +2251,7 @@ fn palette_item(
                     }
                 })
                 .collect();
-            container_box(
+            container(
                 stack((
                     svg(move || {
                         let config = config.get();
@@ -2209,7 +2303,7 @@ fn palette_item(
             } else {
                 vec![]
             };
-            container_box(
+            container(
                 stack((
                     focus_text(
                         move || text.clone(),
@@ -2245,13 +2339,14 @@ fn palette_item(
         | PaletteItemContent::Workspace { .. }
         | PaletteItemContent::SshHost { .. }
         | PaletteItemContent::Language { .. }
+        | PaletteItemContent::LineEnding { .. }
         | PaletteItemContent::ColorTheme { .. }
         | PaletteItemContent::SCMReference { .. }
         | PaletteItemContent::TerminalProfile { .. }
         | PaletteItemContent::IconTheme { .. } => {
             let text = item.filter_text;
             let indices = item.indices;
-            container_box(
+            container(
                 focus_text(
                     move || text.clone(),
                     move || indices.clone(),
@@ -2264,7 +2359,7 @@ fn palette_item(
         PaletteItemContent::WslHost { .. } => {
             let text = item.filter_text;
             let indices = item.indices;
-            container_box(
+            container(
                 focus_text(
                     move || text.clone(),
                     move || indices.clone(),
@@ -2292,7 +2387,9 @@ fn palette_input(window_tab_data: Rc<WindowTabData>) -> impl View {
     let focus = window_tab_data.common.focus;
     let is_focused = move || focus.get() == Focus::Palette;
 
-    let input = text_input(editor, is_focused)
+    let input = TextInputBuilder::new()
+        .is_focused(is_focused)
+        .build_editor(editor)
         .placeholder(move || window_tab_data.palette.placeholder_text().to_owned())
         .style(|s| s.width_full());
 
@@ -2399,7 +2496,7 @@ fn palette_content(
             )
             .style(|s| s.width_full().flex_col())
         })
-        .on_ensure_visible(move || {
+        .ensure_visible(move || {
             Size::new(1.0, palette_item_height)
                 .to_rect()
                 .with_origin(Point::new(
@@ -2407,7 +2504,11 @@ fn palette_content(
                     index.get() as f64 * palette_item_height,
                 ))
         })
-        .style(|s| s.width_full().min_height(0.0)),
+        .style(|s| {
+            s.width_full()
+                .min_height(0.0)
+                .set(PropagatePointerWheel, false)
+        }),
         text("No matching results").style(move |s| {
             s.display(if items.with(|items| items.is_empty()) {
                 Display::Flex
@@ -2477,7 +2578,7 @@ fn palette(window_tab_data: Rc<WindowTabData>) -> impl View {
         .on_event_stop(EventListener::PointerDown, move |_| {})
         .style(move |s| {
             let config = config.get();
-            s.width(500.0)
+            s.width(config.ui.palette_width() as f64)
                 .max_width_full()
                 .max_height(if has_preview.get() {
                     PxPctAuto::Auto
@@ -2489,7 +2590,7 @@ fn palette(window_tab_data: Rc<WindowTabData>) -> impl View {
                 } else {
                     PxPctAuto::Auto
                 })
-                .margin_top(5.0)
+                .margin_top(4.0)
                 .border(1.0)
                 .border_radius(6.0)
                 .border_color(config.color(LapceColor::LAPCE_BORDER))
@@ -2558,6 +2659,7 @@ fn window_message_view(
                     },
                     || false,
                     || false,
+                    || "Close",
                     config,
                 )
                 .style(|s| s.margin_left(6.0)),
@@ -2653,20 +2755,18 @@ fn hover(window_tab_data: Rc<WindowTabData>) -> impl View {
             move || hover_data.content.get(),
             move |_| id.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             move |content| match content {
-                MarkdownContent::Text(text_layout) => container_box(
+                MarkdownContent::Text(text_layout) => container(
                     rich_text(move || text_layout.clone())
                         .style(|s| s.max_width(600.0)),
                 )
                 .style(|s| s.max_width_full()),
-                MarkdownContent::Image { .. } => container_box(empty()),
-                MarkdownContent::Separator => {
-                    container_box(empty().style(move |s| {
-                        s.width_full()
-                            .margin_vert(5.0)
-                            .height(1.0)
-                            .background(config.get().color(LapceColor::LAPCE_BORDER))
-                    }))
-                }
+                MarkdownContent::Image { .. } => container(empty()),
+                MarkdownContent::Separator => container(empty().style(move |s| {
+                    s.width_full()
+                        .margin_vert(5.0)
+                        .height(1.0)
+                        .background(config.get().color(LapceColor::LAPCE_BORDER))
+                })),
             },
         )
         .style(|s| s.flex_col().padding_horiz(10.0).padding_vert(5.0)),
@@ -2690,6 +2790,7 @@ fn hover(window_tab_data: Rc<WindowTabData>) -> impl View {
                     .border_radius(6.0)
                     .border_color(config.color(LapceColor::LAPCE_BORDER))
                     .background(config.color(LapceColor::PANEL_BACKGROUND))
+                    .set(PropagatePointerWheel, false)
             } else {
                 s.hide()
             }
@@ -2699,6 +2800,7 @@ fn hover(window_tab_data: Rc<WindowTabData>) -> impl View {
 
 fn completion(window_tab_data: Rc<WindowTabData>) -> impl View {
     let completion_data = window_tab_data.common.completion;
+    let active_editor = window_tab_data.main_split.active_editor;
     let config = window_tab_data.common.config;
     let active = completion_data.with_untracked(|c| c.active);
     let request_id =
@@ -2742,15 +2844,29 @@ fn completion(window_tab_data: Rc<WindowTabData>) -> impl View {
                         move || item.indices.clone(),
                         move || config.get().color(LapceColor::EDITOR_FOCUS),
                     )
+                    .on_click_stop(move |_| {
+                        active.set(i);
+                        if let Some(editor) = active_editor.get_untracked() {
+                            editor.select_completion();
+                        }
+                    })
+                    .on_event_stop(EventListener::PointerDown, |_| {})
                     .style(move |s| {
                         let config = config.get();
                         s.padding_horiz(5.0)
                             .min_width(0.0)
                             .align_items(Some(AlignItems::Center))
                             .size_full()
+                            .cursor(CursorStyle::Pointer)
                             .apply_if(active.get() == i, |s| {
                                 s.background(
                                     config.color(LapceColor::COMPLETION_CURRENT),
+                                )
+                            })
+                            .hover(move |s| {
+                                s.background(
+                                    config
+                                        .color(LapceColor::PANEL_HOVERED_BACKGROUND),
                                 )
                             })
                     }),
@@ -2768,7 +2884,7 @@ fn completion(window_tab_data: Rc<WindowTabData>) -> impl View {
                 .flex_col()
         }),
     )
-    .on_ensure_visible(move || {
+    .ensure_visible(move || {
         let config = config.get();
         let active = active.get();
         Size::new(1.0, config.editor.line_height() as f64)
@@ -2820,6 +2936,12 @@ fn code_action(window_tab_data: Rc<WindowTabData>) -> impl View {
                         text(item.title().replace('\n', " "))
                             .style(|s| s.text_ellipsis().min_width(0.0)),
                     )
+                    .on_click_stop(move |_| {
+                        let code_action = code_action.get_untracked();
+                        code_action.active.set(i);
+                        code_action.select();
+                    })
+                    .on_event_stop(EventListener::PointerDown, |_| {})
                     .style(move |s| {
                         let config = config.get();
                         s.padding_horiz(10.0)
@@ -2827,9 +2949,17 @@ fn code_action(window_tab_data: Rc<WindowTabData>) -> impl View {
                             .min_width(0.0)
                             .width_full()
                             .line_height(1.6)
+                            .border_radius(6.0)
+                            .cursor(CursorStyle::Pointer)
                             .apply_if(active.get() == i, |s| {
-                                s.border_radius(6.0).background(
+                                s.background(
                                     config.color(LapceColor::COMPLETION_CURRENT),
+                                )
+                            })
+                            .hover(move |s| {
+                                s.background(
+                                    config
+                                        .color(LapceColor::PANEL_HOVERED_BACKGROUND),
                                 )
                             })
                     })
@@ -2839,7 +2969,7 @@ fn code_action(window_tab_data: Rc<WindowTabData>) -> impl View {
         )
         .style(|s| s.width_full().padding_vert(4.0)),
     )
-    .on_ensure_visible(move || {
+    .ensure_visible(move || {
         let config = config.get();
         let active = active.get();
         Size::new(1.0, config.editor.line_height() as f64)
@@ -2879,7 +3009,10 @@ fn rename(window_tab_data: Rc<WindowTabData>) -> impl View {
 
     container(
         container(
-            text_input(editor, move || active.get()).style(|s| s.width(150.0)),
+            TextInputBuilder::new()
+                .is_focused(move || active.get())
+                .build_editor(editor)
+                .style(|s| s.width(150.0)),
         )
         .style(move |s| {
             let config = config.get();
@@ -3049,6 +3182,7 @@ fn workspace_tab_header(window_data: WindowData) -> impl View {
                                 },
                                 || false,
                                 || false,
+                                || "Close",
                                 config.read_only(),
                             )
                             .style(|s| s.margin_horiz(6.0))
@@ -3205,6 +3339,7 @@ fn workspace_tab_header(window_data: WindowData) -> impl View {
             },
             || false,
             || false,
+            || "New Workspace Tab",
             config.read_only(),
         ))
         .on_resize(move |rect| {
@@ -3339,7 +3474,8 @@ fn logging() -> (Handle<Targets>, Option<WorkerGuard>) {
 
     let log_file_filter_targets = filter::Targets::new()
         .with_target("lapce_app", LevelFilter::DEBUG)
-        .with_target("lapce_proxy", LevelFilter::DEBUG);
+        .with_target("lapce_proxy", LevelFilter::DEBUG)
+        .with_target("lapce_core", LevelFilter::DEBUG);
     let (log_file_filter, reload_handle) =
         reload::Subscriber::new(log_file_filter_targets);
 
@@ -3371,6 +3507,8 @@ pub fn launch() {
     let (reload_handle, _guard) = logging();
     tracing::info!("Starting up Lapce..");
 
+    panic_hook();
+
     // if PWD is not set, then we are not being launched via a terminal
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if std::env::var("PWD").is_err() {
@@ -3398,6 +3536,8 @@ pub fn launch() {
         return;
     }
 
+    // If the cli is not requesting a new window, and we're not developing a plugin, we try to open
+    // in the existing Lapce process
     if !cli.new {
         if let Ok(socket) = get_socket() {
             if let Err(e) = try_open_in_existing_process(socket, &cli.paths) {
@@ -3417,13 +3557,24 @@ pub fn launch() {
     crate::update::cleanup();
 
     let _ = lapce_proxy::register_lapce_path();
-    let db = Arc::new(LapceDb::new().unwrap());
+    let db = match LapceDb::new() {
+        Ok(db) => Arc::new(db),
+        Err(e) => {
+            #[cfg(windows)]
+            error_modal("Error", &format!("Failed to create LapceDb: {e}"));
+            #[cfg(not(windows))]
+            error!("Failed to create LapceDb: {e}");
+            std::process::exit(1);
+        }
+    };
     let scope = Scope::new();
     provide_context(db.clone());
 
     let window_scale = scope.create_rw_signal(1.0);
     let latest_release = scope.create_rw_signal(Arc::new(None));
     let app_command = Listener::new_empty(scope);
+
+    let plugin_paths = Arc::new(cli.plugin_path);
 
     let (tx, rx) = crossbeam_channel::bounded(1);
     let mut watcher = notify::recommended_watcher(ConfigWatcher::new(tx)).unwrap();
@@ -3441,7 +3592,7 @@ pub fn launch() {
     }
 
     let windows = scope.create_rw_signal(im::HashMap::new());
-    let config = LapceConfig::load(&LapceWorkspace::default(), &[]);
+    let config = LapceConfig::load(&LapceWorkspace::default(), &[], &plugin_paths);
     let config = scope.create_rw_signal(Arc::new(config));
     let app_data = AppData {
         windows,
@@ -3453,6 +3604,7 @@ pub fn launch() {
         app_command,
         tracing_handle: reload_handle,
         config,
+        plugin_paths,
     };
 
     let app = app_data.create_windows(db.clone(), cli.paths);
@@ -3529,11 +3681,13 @@ pub fn launch() {
 fn load_shell_env() {
     use std::process::Command;
 
+    use tracing::warn;
+
     let shell = match std::env::var("SHELL") {
         Ok(s) => s,
-        Err(_) => {
+        Err(error) => {
             // Shell variable is not set, so we can't determine the correct shell executable.
-            // Silently failing, since logger is not set up yet.
+            error!("Failed to obtain shell environment: {error}");
             return;
         }
     };
@@ -3545,8 +3699,8 @@ fn load_shell_env() {
     let env = match command.output() {
         Ok(output) => String::from_utf8(output.stdout).unwrap_or_default(),
 
-        Err(_) => {
-            // sliently ignoring since logger is not yet available
+        Err(error) => {
+            error!("Failed to obtain shell environment: {error}");
             return;
         }
     };
@@ -3554,6 +3708,9 @@ fn load_shell_env() {
     env.split('\n')
         .filter_map(|line| line.split_once('='))
         .for_each(|(key, value)| {
+            if let Ok(v) = std::env::var(key) {
+                warn!("Overwriting '{key}', previous value: '{v}', new value '{value}'");
+            };
             std::env::set_var(key, value);
         })
 }
@@ -3606,9 +3763,10 @@ fn listen_local_socket(tx: Sender<CoreNotification>) -> Result<()> {
         std::thread::spawn(move || -> Result<()> {
             let mut reader = BufReader::new(stream);
             loop {
-                let msg: CoreMessage = lapce_rpc::stdio::read_msg(&mut reader)?;
+                let msg: Option<CoreMessage> =
+                    lapce_rpc::stdio::read_msg(&mut reader)?;
 
-                if let RpcMessage::Notification(msg) = msg {
+                if let Some(RpcMessage::Notification(msg)) = msg {
                     tx.send(msg)?;
                 } else {
                     trace!("Unhandled message: {msg:?}");
@@ -3733,6 +3891,74 @@ pub fn window_menu(
                     });
                 })),
         )
+}
+
+fn panic_hook() {
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let thread = thread.name().unwrap_or("main");
+        let backtrace = backtrace::Backtrace::new();
+
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s
+        } else {
+            "<unknown>"
+        };
+
+        match info.location() {
+            Some(loc) => {
+                error!(
+                    target: "lapce_app::panic_hook",
+                    "thread {thread} panicked at {} | file://./{}:{}:{}\n{:?}",
+                    payload,
+                    loc.file(), loc.line(), loc.column(),
+                    backtrace,
+                );
+            }
+            None => {
+                error!(
+                    target: "lapce_app::panic_hook",
+                    "thread {thread} panicked at {}\n{:?}",
+                    payload,
+                    backtrace,
+                );
+            }
+        }
+
+        #[cfg(windows)]
+        error_modal("Error", &info.to_string());
+    }))
+}
+
+#[cfg(windows)]
+fn error_modal(title: &str, msg: &str) -> i32 {
+    use std::iter::once;
+    use std::os::windows::prelude::OsStrExt;
+    use std::{ffi::OsStr, mem};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONERROR, MB_SYSTEMMODAL,
+    };
+
+    let result: i32;
+
+    let title = OsStr::new(title)
+        .encode_wide()
+        .chain(once(0u16))
+        .collect::<Vec<u16>>();
+    let msg = OsStr::new(msg)
+        .encode_wide()
+        .chain(once(0u16))
+        .collect::<Vec<u16>>();
+    unsafe {
+        result = MessageBoxW(
+            mem::zeroed(),
+            msg.as_ptr(),
+            title.as_ptr(),
+            MB_ICONERROR | MB_SYSTEMMODAL,
+        );
+    }
+
+    result
 }
 
 fn fetch_grammars() -> Result<()> {

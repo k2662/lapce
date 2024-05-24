@@ -4,11 +4,11 @@ use floem::{
     event::EventListener,
     reactive::ReadSignal,
     style::{CursorStyle, Style},
-    view::View,
     views::{
         container, label, scroll, stack, svg, virtual_stack, Decorators,
         VirtualDirection, VirtualItemSize,
     },
+    View,
 };
 use lapce_xi_rope::find::CaseMatching;
 
@@ -21,7 +21,7 @@ use crate::{
     focus_text::focus_text,
     global_search::{GlobalSearchData, SearchMatchData},
     listener::Listener,
-    text_input::text_input,
+    text_input::TextInputBuilder,
     window_tab::{Focus, WindowTabData},
     workspace::LapceWorkspace,
 };
@@ -45,7 +45,10 @@ pub fn global_search_panel(
     stack((
         container(
             stack((
-                text_input(editor, is_focused).style(|s| s.width_pct(100.0)),
+                TextInputBuilder::new()
+                    .is_focused(is_focused)
+                    .build_editor(editor.clone())
+                    .style(|s| s.width_pct(100.0)),
                 clickable_icon(
                     || LapceIcons::SEARCH_CASE_SENSITIVE,
                     move || {
@@ -57,6 +60,7 @@ pub fn global_search_panel(
                     },
                     move || case_matching.get() == CaseMatching::Exact,
                     || false,
+                    || "Case Sensitive",
                     config,
                 )
                 .style(|s| s.padding_vert(4.0)),
@@ -69,6 +73,7 @@ pub fn global_search_panel(
                     },
                     move || whole_word.get(),
                     || false,
+                    || "Whole Word",
                     config,
                 )
                 .style(|s| s.padding_left(6.0)),
@@ -81,6 +86,7 @@ pub fn global_search_panel(
                     },
                     move || is_regex.get(),
                     || false,
+                    || "Use Regex",
                     config,
                 )
                 .style(|s| s.padding_left(6.0)),

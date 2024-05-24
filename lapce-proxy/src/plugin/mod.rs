@@ -4,7 +4,6 @@ pub mod lsp;
 pub mod psp;
 pub mod wasi;
 
-use std::time::Duration;
 use std::{
     borrow::Cow,
     collections::HashMap,
@@ -14,6 +13,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use anyhow::{anyhow, Result};
@@ -1082,14 +1082,21 @@ impl PluginCatalogRpcHandler {
         version: i32,
         text: String,
     ) {
-        let _ = self.plugin_tx.send(PluginCatalogRpc::DidOpenTextDocument {
-            document: TextDocumentItem::new(
-                Url::from_file_path(path).unwrap(),
-                language_id,
-                version,
-                text,
-            ),
-        });
+        match Url::from_file_path(path) {
+            Ok(path) => {
+                let _ = self.plugin_tx.send(PluginCatalogRpc::DidOpenTextDocument {
+                    document: TextDocumentItem::new(
+                        path,
+                        language_id,
+                        version,
+                        text,
+                    ),
+                });
+            }
+            Err(_) => {
+                tracing::error!("Failed to parse URL from file path: {path:?}");
+            }
+        }
     }
 
     pub fn unactivated_volts(&self, volts: Vec<VoltMetadata>) -> Result<()> {
@@ -1536,6 +1543,7 @@ fn client_capabilities() -> ClientCapabilities {
                 ..Default::default()
             }),
             configuration: Some(false),
+            workspace_folders: Some(true),
             ..Default::default()
         }),
         ..Default::default()

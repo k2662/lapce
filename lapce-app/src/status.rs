@@ -4,10 +4,11 @@ use std::{
 };
 
 use floem::{
-    reactive::{create_memo, ReadSignal, RwSignal},
+    event::EventPropagation,
+    reactive::{create_memo, Memo, ReadSignal, RwSignal},
     style::{AlignItems, CursorStyle, Display},
-    view::View,
     views::{dyn_stack, label, stack, svg, Decorators},
+    View,
 };
 use indexmap::IndexMap;
 use lapce_core::mode::{Mode, VisualMode};
@@ -17,7 +18,7 @@ use crate::{
     app::clickable_icon,
     command::LapceWorkbenchCommand,
     config::{color::LapceColor, icon::LapceIcons, LapceConfig},
-    doc::DocumentExt,
+    editor::EditorData,
     listener::Listener,
     palette::kind::PaletteKind,
     panel::{kind::PanelKind, position::PanelContainerPosition},
@@ -42,7 +43,7 @@ pub fn status(
         let mut warnings = 0;
         for (_, diagnostics) in diagnostics.get().iter() {
             for diagnostic in diagnostics.diagnostics.get().iter() {
-                if let Some(severity) = diagnostic.diagnostic.severity {
+                if let Some(severity) = diagnostic.severity {
                     match severity {
                         DiagnosticSeverity::ERROR => errors += 1,
                         DiagnosticSeverity::WARNING => warnings += 1,
@@ -69,6 +70,7 @@ pub fn status(
 
     let progresses = window_tab_data.progresses;
     let mode = create_memo(move |_| window_tab_data.mode());
+    let pointer_down = floem::reactive::create_rw_signal(false);
 
     stack((
         stack((
@@ -146,9 +148,20 @@ pub fn status(
                     )
                 })
             })
-            .on_click_stop(move |_| {
-                workbench_command.send(LapceWorkbenchCommand::PaletteSCMReferences);
-            }),
+            .on_event_cont(floem::event::EventListener::PointerDown, move |_| {
+                pointer_down.set(true);
+            })
+            .on_event(
+                floem::event::EventListener::PointerUp,
+                move |_| {
+                    if pointer_down.get() {
+                        workbench_command
+                            .send(LapceWorkbenchCommand::PaletteSCMReferences);
+                    }
+                    pointer_down.set(false);
+                    EventPropagation::Continue
+                },
+            ),
             {
                 let panel = panel.clone();
                 stack((
@@ -230,6 +243,7 @@ pub fn status(
                     },
                     || false,
                     || false,
+                    || "Toggle Left Panel",
                     config,
                 )
             },
@@ -256,6 +270,7 @@ pub fn status(
                     },
                     || false,
                     || false,
+                    || "Toggle Bottom Panel",
                     config,
                 )
             },
@@ -280,6 +295,7 @@ pub fn status(
                     },
                     || false,
                     || false,
+                    || "Toggle Right Panel",
                     config,
                 )
             },
@@ -291,13 +307,12 @@ pub fn status(
         }),
         stack({
             let palette_clone = palette.clone();
-            let cursor_info = label(move || {
+            let cursor_info = status_text(config, editor, move || {
                 if let Some(editor) = editor.get() {
                     let mut status = String::new();
-                    let cursor = editor.cursor.get();
+                    let cursor = editor.cursor().get();
                     if let Some((line, column, character)) = editor
-                        .view
-                        .doc
+                        .doc_signal()
                         .get()
                         .buffer
                         .with(|buffer| cursor.get_line_col_char(buffer))
@@ -325,36 +340,23 @@ pub fn status(
             })
             .on_click_stop(move |_| {
                 palette_clone.run(PaletteKind::Line);
-            })
-            .style(move |s| {
-                let config = config.get();
-                s.display(
-                    if editor
-                        .get()
-                        .map(|editor| {
-                            editor.view.doc.get().content.with(|c| c.is_file())
-                        })
-                        .unwrap_or(false)
-                    {
-                        Display::Flex
-                    } else {
-                        Display::None
-                    },
-                )
-                .height_pct(100.0)
-                .padding_horiz(10.0)
-                .items_center()
-                .color(config.color(LapceColor::STATUS_FOREGROUND))
-                .hover(|s| {
-                    s.cursor(CursorStyle::Pointer).background(
-                        config.color(LapceColor::PANEL_HOVERED_BACKGROUND),
-                    )
-                })
             });
             let palette_clone = palette.clone();
-            let language_info = label(move || {
+            let line_ending_info = status_text(config, editor, move || {
                 if let Some(editor) = editor.get() {
-                    let doc = editor.view.doc.get();
+                    let doc = editor.doc_signal().get();
+                    doc.buffer.with(|b| b.line_ending()).as_str()
+                } else {
+                    ""
+                }
+            })
+            .on_click_stop(move |_| {
+                palette_clone.run(PaletteKind::LineEnding);
+            });
+            let palette_clone = palette.clone();
+            let language_info = status_text(config, editor, move || {
+                if let Some(editor) = editor.get() {
+                    let doc = editor.doc_signal().get();
                     doc.syntax().with(|s| s.language.name())
                 } else {
                     "unknown"
@@ -362,33 +364,8 @@ pub fn status(
             })
             .on_click_stop(move |_| {
                 palette_clone.run(PaletteKind::Language);
-            })
-            .style(move |s| {
-                let config = config.get();
-                s.display(
-                    if editor
-                        .get()
-                        .map(|editor| {
-                            editor.view.doc.get().content.with(|c| c.is_file())
-                        })
-                        .unwrap_or(false)
-                    {
-                        Display::Flex
-                    } else {
-                        Display::None
-                    },
-                )
-                .height_pct(100.0)
-                .padding_horiz(10.0)
-                .items_center()
-                .color(config.color(LapceColor::STATUS_FOREGROUND))
-                .hover(|s| {
-                    s.cursor(CursorStyle::Pointer).background(
-                        config.color(LapceColor::PANEL_HOVERED_BACKGROUND),
-                    )
-                })
             });
-            (cursor_info, language_info)
+            (cursor_info, line_ending_info, language_info)
         })
         .style(|s| {
             s.height_pct(100.0)
@@ -437,4 +414,33 @@ fn progress_view(
             })
         },
     )
+}
+
+fn status_text<S: std::fmt::Display + 'static>(
+    config: ReadSignal<Arc<LapceConfig>>,
+    editor: Memo<Option<EditorData>>,
+    text: impl Fn() -> S + 'static,
+) -> impl View {
+    label(text).style(move |s| {
+        let config = config.get();
+        let display = if editor
+            .get()
+            .map(|editor| editor.doc_signal().get().content.with(|c| c.is_file()))
+            .unwrap_or(false)
+        {
+            Display::Flex
+        } else {
+            Display::None
+        };
+
+        s.display(display)
+            .height_full()
+            .padding_horiz(10.0)
+            .items_center()
+            .color(config.color(LapceColor::STATUS_FOREGROUND))
+            .hover(|s| {
+                s.cursor(CursorStyle::Pointer)
+                    .background(config.color(LapceColor::PANEL_HOVERED_BACKGROUND))
+            })
+    })
 }

@@ -5,22 +5,26 @@ use floem::{
     peniko::kurbo::{Point, Rect, Size},
     reactive::{create_memo, create_rw_signal, RwSignal},
     style::CursorStyle,
-    view::View,
     views::{
-        container, dyn_container, img, label, scroll, stack, svg, virtual_stack,
-        Decorators, VirtualDirection, VirtualItemSize, VirtualVector,
+        container, dyn_container, img, label,
+        scroll::{scroll, HideBar},
+        stack, svg, virtual_stack, Decorators, VirtualDirection, VirtualItemSize,
+        VirtualVector,
     },
+    IntoView, View,
 };
 use indexmap::IndexMap;
 use lapce_rpc::plugin::{VoltID, VoltInfo};
 
-use super::{kind::PanelKind, position::PanelPosition, view::panel_header};
+use super::{
+    data::PanelSection, kind::PanelKind, position::PanelPosition, view::PanelBuilder,
+};
 use crate::{
-    app::clickable_icon,
+    app::not_clickable_icon,
     command::InternalCommand,
     config::{color::LapceColor, icon::LapceIcons},
     plugin::{AvailableVoltData, InstalledVoltData, PluginData, VoltIcon},
-    text_input::text_input,
+    text_input::TextInputBuilder,
     window_tab::{Focus, WindowTabData},
 };
 
@@ -65,22 +69,18 @@ pub fn plugin_panel(
     let config = window_tab_data.common.config;
     let plugin = window_tab_data.plugin.clone();
 
-    stack((
-        stack((
-            panel_header("Installed".to_string(), config),
+    PanelBuilder::new(config, position)
+        .add(
+            "Installed",
             installed_view(plugin.clone()),
-        ))
-        .style(|s| s.flex_col().width_pct(100.0).flex_grow(1.0).flex_basis(0.0)),
-        stack((
-            panel_header("Available".to_string(), config),
+            window_tab_data.panel.section_open(PanelSection::Installed),
+        )
+        .add(
+            "Available",
             available_view(plugin.clone()),
-        ))
-        .style(|s| s.flex_col().width_pct(100.0).flex_grow(1.0).flex_basis(0.0)),
-    ))
-    .style(move |s| {
-        s.width_pct(100.0)
-            .apply_if(!position.is_bottom(), |s| s.flex_col())
-    })
+            window_tab_data.panel.section_open(PanelSection::Available),
+        )
+        .build()
 }
 
 fn installed_view(plugin: PluginData) -> impl View {
@@ -100,15 +100,14 @@ fn installed_view(plugin: PluginData) -> impl View {
             dyn_container(
                 move || icon.get(),
                 move |icon| match icon {
-                    None => Box::new(
-                        img(move || VOLT_DEFAULT_PNG.to_vec())
-                            .style(|s| s.size_full()),
-                    ),
-                    Some(VoltIcon::Svg(svg_str)) => Box::new(
-                        svg(move || svg_str.clone()).style(|s| s.size_full()),
-                    ),
+                    None => img(move || VOLT_DEFAULT_PNG.to_vec())
+                        .style(|s| s.size_full())
+                        .into_any(),
+                    Some(VoltIcon::Svg(svg_str)) => svg(move || svg_str.clone())
+                        .style(|s| s.size_full())
+                        .into_any(),
                     Some(VoltIcon::Img(buf)) => {
-                        Box::new(img(move || buf.clone()).style(|s| s.size_full()))
+                        img(move || buf.clone()).style(|s| s.size_full()).into_any()
                     }
                 },
             )
@@ -149,11 +148,11 @@ fn installed_view(plugin: PluginData) -> impl View {
                             .flex_basis(0.0)
                             .min_width(0.0)
                     }),
-                    clickable_icon(
+                    not_clickable_icon(
                         || LapceIcons::SETTINGS,
-                        || {},
                         || false,
                         || false,
+                        || "Options",
                         config,
                     )
                     .style(|s| s.padding_left(6.0))
@@ -267,15 +266,14 @@ fn available_view(plugin: PluginData) -> impl View {
             dyn_container(
                 move || icon.get(),
                 move |icon| match icon {
-                    None => Box::new(
-                        img(move || VOLT_DEFAULT_PNG.to_vec())
-                            .style(|s| s.size_full()),
-                    ),
-                    Some(VoltIcon::Svg(svg_str)) => Box::new(
-                        svg(move || svg_str.clone()).style(|s| s.size_full()),
-                    ),
+                    None => img(move || VOLT_DEFAULT_PNG.to_vec())
+                        .style(|s| s.size_full())
+                        .into_any(),
+                    Some(VoltIcon::Svg(svg_str)) => svg(move || svg_str.clone())
+                        .style(|s| s.size_full())
+                        .into_any(),
                     Some(VoltIcon::Img(buf)) => {
-                        Box::new(img(move || buf.clone()).style(|s| s.size_full()))
+                        img(move || buf.clone()).style(|s| s.size_full()).into_any()
                     }
                 },
             )
@@ -331,7 +329,9 @@ fn available_view(plugin: PluginData) -> impl View {
     stack((
         container({
             scroll(
-                text_input(editor, is_focused)
+                TextInputBuilder::new()
+                    .is_focused(is_focused)
+                    .build_editor(editor.clone())
                     .on_cursor_pos(move |point| {
                         cursor_x.set(point.x);
                     })
@@ -339,8 +339,7 @@ fn available_view(plugin: PluginData) -> impl View {
                         s.padding_vert(4.0).padding_horiz(10.0).min_width_pct(100.0)
                     }),
             )
-            .hide_bar(|| true)
-            .on_ensure_visible(move || {
+            .ensure_visible(move || {
                 Size::new(20.0, 0.0)
                     .to_rect()
                     .with_origin(Point::new(cursor_x.get(), 0.0))
@@ -350,7 +349,8 @@ fn available_view(plugin: PluginData) -> impl View {
             })
             .style(move |s| {
                 let config = config.get();
-                s.width_pct(100.0)
+                s.set(HideBar, true)
+                    .width_pct(100.0)
                     .cursor(CursorStyle::Text)
                     .items_center()
                     .background(config.color(LapceColor::EDITOR_BACKGROUND))

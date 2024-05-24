@@ -5,8 +5,10 @@ use floem::{
     ext_event::create_ext_action,
     reactive::{RwSignal, Scope},
     style::CursorStyle,
-    view::View,
-    views::{clip, dyn_stack, empty, label, stack, svg, Decorators},
+    views::{
+        clip, dyn_stack, editor::id::EditorId, empty, label, stack, svg, Decorators,
+    },
+    View,
 };
 use lapce_core::buffer::{
     diff::{expand_diff_lines, rope_diff, DiffExpand, DiffLines},
@@ -18,9 +20,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{color::LapceColor, icon::LapceIcons},
-    doc::{DocContent, Document},
-    id::{DiffEditorId, EditorId, EditorTabId},
-    main_split::MainSplitData,
+    doc::{Doc, DocContent},
+    id::{DiffEditorId, EditorTabId},
+    main_split::{Editors, MainSplitData},
     wave::wave_box,
     window_tab::CommonData,
 };
@@ -54,15 +56,19 @@ impl DiffEditorInfo {
             let common = data.common.clone();
             move |content: &DocContent| match content {
                 DocContent::File { path, .. } => {
-                    let (doc, _) = data.get_doc(path.clone());
+                    let (doc, _) = data.get_doc(path.clone(), None);
                     doc
                 }
                 DocContent::Local => {
-                    Rc::new(Document::new_local(cx, common.clone()))
+                    Rc::new(Doc::new_local(cx, data.editors, common.clone()))
                 }
                 DocContent::History(history) => {
-                    let doc =
-                        Document::new_hisotry(cx, content.clone(), common.clone());
+                    let doc = Doc::new_history(
+                        cx,
+                        content.clone(),
+                        data.editors,
+                        common.clone(),
+                    );
                     let doc = Rc::new(doc);
 
                     {
@@ -91,7 +97,12 @@ impl DiffEditorInfo {
                         id: BufferId::next(),
                         name: name.to_string(),
                     };
-                    let doc = Document::new_content(cx, doc_content, common.clone());
+                    let doc = Doc::new_content(
+                        cx,
+                        doc_content,
+                        data.editors,
+                        common.clone(),
+                    );
                     let doc = Rc::new(doc);
                     data.scratch_docs.update(|scratch_docs| {
                         scratch_docs.insert(name.to_string(), doc.clone());
@@ -110,6 +121,7 @@ impl DiffEditorInfo {
             editor_tab_id,
             left_doc,
             right_doc,
+            data.editors,
             data.common.clone(),
         );
 
@@ -126,8 +138,8 @@ pub struct DiffEditorData {
     pub id: DiffEditorId,
     pub editor_tab_id: RwSignal<EditorTabId>,
     pub scope: Scope,
-    pub left: Rc<EditorData>,
-    pub right: Rc<EditorData>,
+    pub left: EditorData,
+    pub right: EditorData,
     pub confirmed: RwSignal<bool>,
     pub focus_right: RwSignal<bool>,
 }
@@ -137,25 +149,24 @@ impl DiffEditorData {
         cx: Scope,
         id: DiffEditorId,
         editor_tab_id: EditorTabId,
-        left_doc: Rc<Document>,
-        right_doc: Rc<Document>,
+        left_doc: Rc<Doc>,
+        right_doc: Rc<Doc>,
+        editors: Editors,
         common: Rc<CommonData>,
     ) -> Self {
         let cx = cx.create_child();
         let confirmed = cx.create_rw_signal(false);
 
+        // TODO: ensure that left/right are cleaned up
         let [left, right] = [left_doc, right_doc].map(|doc| {
-            let editor_data = EditorData::new(
+            editors.make_from_doc(
                 cx,
+                doc,
                 None,
                 Some((editor_tab_id, id)),
-                EditorId::next(),
-                doc,
                 Some(confirmed),
                 common.clone(),
-            );
-
-            Rc::new(editor_data)
+            )
         });
 
         let data = Self {
@@ -175,14 +186,8 @@ impl DiffEditorData {
 
     pub fn diff_editor_info(&self) -> DiffEditorInfo {
         DiffEditorInfo {
-            left_content: self.left.view.doc.get_untracked().content.get_untracked(),
-            right_content: self
-                .right
-                .view
-                .doc
-                .get_untracked()
-                .content
-                .get_untracked(),
+            left_content: self.left.doc().content.get_untracked(),
+            right_content: self.right.doc().content.get_untracked(),
         }
     }
 
@@ -191,20 +196,21 @@ impl DiffEditorData {
         cx: Scope,
         editor_tab_id: EditorTabId,
         diff_editor_id: EditorId,
+        editors: Editors,
     ) -> Self {
         let cx = cx.create_child();
         let confirmed = cx.create_rw_signal(true);
 
         let [left, right] = [&self.left, &self.right].map(|editor_data| {
-            let editor_data = editor_data.copy(
-                cx,
-                None,
-                Some((editor_tab_id, diff_editor_id)),
-                EditorId::next(),
-                Some(confirmed),
-            );
-
-            Rc::new(editor_data)
+            editors
+                .make_copy(
+                    editor_data.id(),
+                    cx,
+                    None,
+                    Some((editor_tab_id, diff_editor_id)),
+                    Some(confirmed),
+                )
+                .unwrap()
         });
 
         let diff_editor = DiffEditorData {
@@ -228,7 +234,7 @@ impl DiffEditorData {
         let left_doc_rev = {
             let left = left.clone();
             cx.create_memo(move |_| {
-                let doc = left.view.doc.get();
+                let doc = left.doc_signal().get();
                 (doc.content.get(), doc.buffer.with(|b| b.rev()))
             })
         };
@@ -237,23 +243,23 @@ impl DiffEditorData {
         let right_doc_rev = {
             let right = right.clone();
             cx.create_memo(move |_| {
-                let doc = right.view.doc.get();
+                let doc = right.doc_signal().get();
                 (doc.content.get(), doc.buffer.with(|b| b.rev()))
             })
         };
 
         cx.create_effect(move |_| {
             let (_, left_rev) = left_doc_rev.get();
-            let (left_editor_view, left_doc) = (left.view.kind, left.view.doc);
+            let (left_editor_view, left_doc) = (left.kind, left.doc());
             let (left_atomic_rev, left_rope) =
-                left_doc.get_untracked().buffer.with_untracked(|buffer| {
+                left_doc.buffer.with_untracked(|buffer| {
                     (buffer.atomic_rev(), buffer.text().clone())
                 });
 
             let (_, right_rev) = right_doc_rev.get();
-            let (right_editor_view, right_doc) = (right.view.kind, right.view.doc);
+            let (right_editor_view, right_doc) = (right.kind, right.doc());
             let (right_atomic_rev, right_rope) =
-                right_doc.get_untracked().buffer.with_untracked(|buffer| {
+                right_doc.buffer.with_untracked(|buffer| {
                     (buffer.atomic_rev(), buffer.text().clone())
                 });
 
@@ -308,12 +314,12 @@ struct DiffShowMoreSection {
 }
 
 pub fn diff_show_more_section_view(
-    left_editor: Rc<EditorData>,
-    right_editor: Rc<EditorData>,
+    left_editor: &EditorData,
+    right_editor: &EditorData,
 ) -> impl View {
-    let left_editor_view = left_editor.view.kind;
-    let right_editor_view = right_editor.view.kind;
-    let viewport = right_editor.viewport;
+    let left_editor_view = left_editor.kind;
+    let right_editor_view = right_editor.kind;
+    let viewport = right_editor.viewport();
     let config = right_editor.common.config;
 
     let each_fn = move || {
